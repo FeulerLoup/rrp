@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -13,16 +14,20 @@ use tokio::time::{interval, timeout, MissedTickBehavior};
 use tracing::{debug, error, info, warn};
 
 use crate::cli::RunMode;
-use crate::config::{ClientConfig, ProxyConfig, ResolvedServerConfig};
+use crate::config::{ClientConfig, ProxyConfig, ResolvedServerConfig, TunnelMode};
 use crate::crypto::{client_handshake, ClientKeyPair};
 use crate::ebpf::EbpfAccelerator;
 use crate::net_utils::{
     bind_ephemeral_udp_for_target, connect_tcp, connect_tcp_addr, format_server_proxy_addr,
     resolve_socket_addrs,
 };
-use crate::protocol::{ControlSignal, ProxySpec, RoleHandshake, TunnelFrame};
+use crate::protocol::{
+    ControlSignal, ProxySpec, RoleHandshake, TunnelFrame, TunnelRequest, TUNNEL_PROTOCOL_VERSION,
+};
 use crate::relay::relay_encrypted_and_plain_with_status;
 use crate::status::{wait_for_shutdown_signal, ConnectionStatus, RuntimeStatus, StatusReporter};
+use crate::tunnel::plain_relay::{start_tunnel_listeners, TunnelListenerSet};
+use crate::tunnel::{host_supports_tunnel, TunnelClient};
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// First retry happens quickly; subsequent failures back off exponentially up to the maximum so a
@@ -38,14 +43,20 @@ const UDP_OUTBOUND_QUEUE_LEN: usize = 1024;
 /// Upper bound on simultaneously tracked UDP visitors per server session. Each session owns a
 /// socket and a task, so an unbounded number would let a spoofed-source flood exhaust the client.
 const UDP_MAX_SESSIONS: usize = 4096;
+/// Policy-routing table and rule priority base for client tunnel interfaces (one per server).
+const TUNNEL_ROUTE_TABLE_BASE: u32 = 7200;
 
 #[derive(Clone)]
 struct ServerEndpoint {
+    index: usize,
     resolved: ResolvedServerConfig,
     keypair: ClientKeyPair,
     proxies_by_name: Arc<HashMap<String, ProxyConfig>>,
     proxy_statuses: Arc<HashMap<String, ConnectionStatus>>,
     statuses: Vec<ConnectionStatus>,
+    tunnel_mode: TunnelMode,
+    /// Set once a tunnel attempt failed in `auto` mode; later sessions use the relay.
+    tunnel_failed: Arc<AtomicBool>,
 }
 
 impl ServerEndpoint {
@@ -83,6 +94,41 @@ impl ServerEndpoint {
             .cloned()
             .or_else(|| self.statuses.first().cloned())
     }
+
+    fn tunnel_interface(&self) -> String {
+        format!("rrpc-wg{}", self.index)
+    }
+
+    fn tunnel_table(&self) -> u32 {
+        TUNNEL_ROUTE_TABLE_BASE + self.index as u32
+    }
+
+    /// Whether this session should ask the server for the tunnel data plane.
+    fn wants_tunnel(&self) -> Result<bool> {
+        match self.tunnel_mode {
+            TunnelMode::Relay => Ok(false),
+            TunnelMode::Tunnel => match host_supports_tunnel() {
+                Ok(()) => Ok(true),
+                Err(reason) => bail!("tunnel_mode = \"tunnel\" but {}", reason),
+            },
+            TunnelMode::Auto => {
+                if self.tunnel_failed.load(Ordering::Relaxed) {
+                    return Ok(false);
+                }
+                match host_supports_tunnel() {
+                    Ok(()) => Ok(true),
+                    Err(reason) => {
+                        debug!(
+                            "server {}: tunnel data plane not used ({}), relaying instead",
+                            self.display_name(),
+                            reason
+                        );
+                        Ok(false)
+                    }
+                }
+            }
+        }
+    }
 }
 
 pub struct Client {
@@ -96,11 +142,21 @@ impl Client {
     pub fn new(config: ClientConfig) -> Result<Self> {
         let resolved_servers = config.resolve_servers()?;
         let ebpf = EbpfAccelerator::try_init(config.enable_ebpf);
-        let status = RuntimeStatus::new(RunMode::Client, ebpf.status_reason().to_string(), None);
+        let status = RuntimeStatus::new(RunMode::Client, ebpf.status_reason(), None);
+
+        let tunnel_mode = if config.enable_ebpf {
+            config.tunnel_mode
+        } else {
+            TunnelMode::Relay
+        };
+        if tunnel_mode == TunnelMode::Relay {
+            ebpf.set_fallback("relay data plane selected by configuration");
+            status.set_ebpf_status(ebpf.status_reason());
+        }
 
         let multi_server = resolved_servers.len() > 1;
         let mut endpoints = Vec::with_capacity(resolved_servers.len());
-        for srv in resolved_servers {
+        for (index, srv) in resolved_servers.into_iter().enumerate() {
             let keypair = ClientKeyPair::from_base64(&srv.private_key)?;
             let mut proxies_by_name = HashMap::with_capacity(srv.proxies.len());
             let mut proxy_statuses = HashMap::with_capacity(srv.proxies.len());
@@ -136,20 +192,24 @@ impl Client {
             }
 
             endpoints.push(ServerEndpoint {
+                index,
                 resolved: srv,
                 keypair,
                 proxies_by_name: Arc::new(proxies_by_name),
                 proxy_statuses: Arc::new(proxy_statuses),
                 statuses,
+                tunnel_mode,
+                tunnel_failed: Arc::new(AtomicBool::new(false)),
             });
         }
 
         let server_names: Vec<String> = endpoints.iter().map(|e| e.display_name()).collect();
         info!(
-            "rrp client initialized for {} server(s) [{}] (ebpf: {})",
+            "rrp client initialized for {} server(s) [{}] (data plane: {}, tunnel_mode: {})",
             endpoints.len(),
             server_names.join(", "),
-            ebpf.status_reason()
+            ebpf.status_reason(),
+            tunnel_mode.as_str()
         );
 
         Ok(Self {
@@ -400,6 +460,13 @@ struct UdpSessionHandle {
 
 type UdpSessions = Arc<DashMap<(String, SocketAddr), UdpSessionHandle>>;
 
+/// Everything the client holds while a session runs over the tunnel data plane. Dropping the
+/// listeners stops them; the interface is removed explicitly so netlink errors can be logged.
+struct ClientTunnelState {
+    tunnel: TunnelClient,
+    listeners: TunnelListenerSet,
+}
+
 async fn run_endpoint_session_inner(
     endpoint: &ServerEndpoint,
     ebpf: &EbpfAccelerator,
@@ -407,6 +474,7 @@ async fn run_endpoint_session_inner(
 ) -> Result<()> {
     let server_addr = &endpoint.resolved.server_addr;
     let display_name = endpoint.display_name();
+    let want_tunnel = endpoint.wants_tunnel()?;
 
     let tcp = connect_tcp(server_addr)
         .await
@@ -444,7 +512,12 @@ async fn run_endpoint_session_inner(
         })
         .collect();
 
-    let role = RoleHandshake::Control { proxies: specs };
+    let role = RoleHandshake::Control {
+        proxies: specs,
+        tunnel: want_tunnel.then_some(TunnelRequest {
+            version: TUNNEL_PROTOCOL_VERSION,
+        }),
+    };
     enc_stream.send_frame(&role.encode()?).await?;
 
     let ack_raw = timeout(HANDSHAKE_TIMEOUT, enc_stream.recv_frame())
@@ -462,8 +535,12 @@ async fn run_endpoint_session_inner(
             )
         })?;
 
-    match TunnelFrame::decode(ack_raw)? {
-        TunnelFrame::Signal(ControlSignal::RegisterAck { success, message }) => {
+    let assignment = match TunnelFrame::decode(ack_raw)? {
+        TunnelFrame::Signal(ControlSignal::RegisterAck {
+            success,
+            message,
+            tunnel,
+        }) => {
             if !success {
                 let err = anyhow!(
                     "server {} rejected proxy registration: {}",
@@ -475,16 +552,31 @@ async fn run_endpoint_session_inner(
                 }
                 return Err(err);
             }
-            endpoint.mark_connected();
-            info!(
-                "connected to server {} successfully ({} proxies registered: {})",
-                display_name,
-                endpoint.resolved.proxies.len(),
-                message
-            );
-            if let Some(tx) = ready_tx.take() {
-                let _ = tx.send(Ok(()));
+            if tunnel.is_none() {
+                if want_tunnel && endpoint.tunnel_mode == TunnelMode::Tunnel {
+                    bail!(
+                        "server {} does not offer the tunnel data plane but tunnel_mode = \"tunnel\"",
+                        display_name
+                    );
+                }
+                if want_tunnel {
+                    info!(
+                        "server {} does not offer the tunnel data plane; relaying instead",
+                        display_name
+                    );
+                }
+                endpoint.mark_connected();
+                info!(
+                    "connected to server {} successfully ({} proxies registered: {})",
+                    display_name,
+                    endpoint.resolved.proxies.len(),
+                    message
+                );
+                if let Some(tx) = ready_tx.take() {
+                    let _ = tx.send(Ok(()));
+                }
             }
+            tunnel
         }
         other => {
             bail!(
@@ -492,6 +584,114 @@ async fn run_endpoint_session_inner(
                 display_name,
                 other
             );
+        }
+    };
+
+    // Tunnel data plane: bring up WireGuard, bind in-tunnel listeners, report the ports.
+    let mut tunnel_state: Option<ClientTunnelState> = None;
+    if let Some(assignment) = assignment {
+        let setup = async {
+            let tunnel = TunnelClient::setup(
+                &endpoint.tunnel_interface(),
+                &assignment,
+                server_socket_addr.ip(),
+                endpoint.keypair.x25519_private_bytes(),
+                enc_stream.tunnel_psk(),
+                endpoint.tunnel_table(),
+            )
+            .await?;
+            let listeners = match start_tunnel_listeners(
+                tunnel.client_v4,
+                tunnel.client_v6,
+                &endpoint.resolved.proxies,
+                |name| endpoint.proxy_status(name),
+            )
+            .await
+            {
+                Ok(listeners) => listeners,
+                Err(e) => {
+                    tunnel.teardown().await;
+                    return Err(e);
+                }
+            };
+            Ok::<_, anyhow::Error>(ClientTunnelState { tunnel, listeners })
+        };
+        let state = match setup.await {
+            Ok(state) => state,
+            Err(e) => {
+                let err = tunnel_failure(endpoint, &display_name, e);
+                if let Some(tx) = ready_tx.take() {
+                    let _ = tx.send(Err(anyhow!("{}", err)));
+                }
+                return Err(err);
+            }
+        };
+
+        let ready = TunnelFrame::Signal(ControlSignal::TunnelReady {
+            bindings: state.listeners.bindings.clone(),
+        });
+        if let Err(e) = enc_stream.send_frame(&ready.encode()?).await {
+            state.tunnel.teardown().await;
+            return Err(e.into());
+        }
+        let ack = timeout(HANDSHAKE_TIMEOUT, enc_stream.recv_frame()).await;
+        let verdict = match ack {
+            Ok(Ok(Some(raw))) => match TunnelFrame::decode(raw) {
+                Ok(TunnelFrame::Signal(ControlSignal::TunnelAck { success, message })) => {
+                    if success {
+                        Ok(message)
+                    } else {
+                        Err(anyhow!(
+                            "server {} rejected tunnel: {}",
+                            display_name,
+                            message
+                        ))
+                    }
+                }
+                Ok(other) => Err(anyhow!(
+                    "unexpected frame while waiting for TunnelAck from {}: {:?}",
+                    display_name,
+                    other
+                )),
+                Err(e) => Err(e),
+            },
+            Ok(Ok(None)) => Err(anyhow!(
+                "server {} closed connection before TunnelAck",
+                display_name
+            )),
+            Ok(Err(e)) => Err(e.into()),
+            Err(_) => Err(anyhow!(
+                "timed out waiting for TunnelAck from server {}",
+                display_name
+            )),
+        };
+        match verdict {
+            Ok(message) => {
+                endpoint.mark_connected();
+                ebpf.set_active(format!(
+                    "active (WireGuard tunnel {} to {})",
+                    endpoint.tunnel_interface(),
+                    display_name
+                ));
+                info!(
+                    "connected to server {} through the tunnel ({} proxies registered: {})",
+                    display_name,
+                    endpoint.resolved.proxies.len(),
+                    message
+                );
+                if let Some(tx) = ready_tx.take() {
+                    let _ = tx.send(Ok(()));
+                }
+                tunnel_state = Some(state);
+            }
+            Err(e) => {
+                state.tunnel.teardown().await;
+                let err = tunnel_failure(endpoint, &display_name, e);
+                if let Some(tx) = ready_tx.take() {
+                    let _ = tx.send(Err(anyhow!("{}", err)));
+                }
+                return Err(err);
+            }
         }
     }
 
@@ -572,7 +772,10 @@ async fn run_endpoint_session_inner(
             let frame = match TunnelFrame::decode(raw_frame) {
                 Ok(f) => f,
                 Err(e) => {
-                    warn!("failed to decode frame from server {}: {}", display_name, e);
+                    warn!(
+                        "failed to decode frame from server {}: {}",
+                        display_name, e
+                    );
                     continue;
                 }
             };
@@ -583,7 +786,8 @@ async fn run_endpoint_session_inner(
                     proxy_name,
                     visitor_addr,
                 }) => {
-                    let Some(proxy_cfg) = endpoint.proxies_by_name.get(&proxy_name).cloned() else {
+                    let Some(proxy_cfg) = endpoint.proxies_by_name.get(&proxy_name).cloned()
+                    else {
                         warn!(
                             "server {} requested work conn for unknown proxy '{}'",
                             display_name, proxy_name
@@ -591,7 +795,6 @@ async fn run_endpoint_session_inner(
                         continue;
                     };
                     let keypair = endpoint.keypair.clone();
-                    let ebpf = ebpf.clone();
                     let Some(status) = endpoint.proxy_status(&proxy_name) else {
                         continue;
                     };
@@ -603,15 +806,11 @@ async fn run_endpoint_session_inner(
                             visitor_addr,
                             server_socket_addr,
                             keypair,
-                            ebpf,
                             status,
                         )
                         .await
                         {
-                            debug!(
-                                "work connection conn_id={} failed: {:#}",
-                                conn_id, e
-                            );
+                            debug!("work connection conn_id={} failed: {:#}", conn_id, e);
                         }
                     });
                 }
@@ -632,7 +831,8 @@ async fn run_endpoint_session_inner(
                     visitor_addr,
                     payload,
                 } => {
-                    let Some(proxy_cfg) = endpoint.proxies_by_name.get(&proxy_name).cloned() else {
+                    let Some(proxy_cfg) = endpoint.proxies_by_name.get(&proxy_name).cloned()
+                    else {
                         continue;
                     };
                     let Some(status) = endpoint.proxy_status(&proxy_name) else {
@@ -682,18 +882,14 @@ async fn run_endpoint_session_inner(
                     let sessions_clone = Arc::clone(&udp_sessions);
                     let udp_tx_clone = udp_tx.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = run_udp_session(
-                            proxy_cfg,
-                            visitor_addr,
-                            pkt_rx,
-                            udp_tx_clone,
-                            status,
-                        )
-                        .await
+                        if let Err(e) =
+                            run_udp_session(proxy_cfg, visitor_addr, pkt_rx, udp_tx_clone, status)
+                                .await
                         {
                             debug!("UDP session for visitor {} ended: {:#}", visitor_addr, e);
                         }
-                        sessions_clone.remove_if(&key, |_, session| session.generation == generation);
+                        sessions_clone
+                            .remove_if(&key, |_, session| session.generation == generation);
                     });
                 }
             }
@@ -705,7 +901,34 @@ async fn run_endpoint_session_inner(
     udp_sessions.clear();
     hb_handle.abort();
     writer_handle.abort();
+    if let Some(state) = tunnel_state.take() {
+        drop(state.listeners);
+        state.tunnel.teardown().await;
+    }
     read_res
+}
+
+/// Record a failed tunnel attempt: in `auto` mode later sessions fall back to the relay, in
+/// `tunnel` mode the error is surfaced as-is and the session keeps retrying the tunnel.
+fn tunnel_failure(
+    endpoint: &ServerEndpoint,
+    display_name: &str,
+    e: anyhow::Error,
+) -> anyhow::Error {
+    match endpoint.tunnel_mode {
+        TunnelMode::Auto => {
+            endpoint.tunnel_failed.store(true, Ordering::Relaxed);
+            warn!(
+                "tunnel data plane failed for server {}; falling back to relay on reconnect: {:#}",
+                display_name, e
+            );
+            e.context("tunnel data plane failed (falling back to relay)")
+        }
+        _ => e.context(format!(
+            "tunnel data plane failed for server {}",
+            display_name
+        )),
+    }
 }
 
 async fn handle_work_tcp(
@@ -714,7 +937,6 @@ async fn handle_work_tcp(
     visitor_addr: String,
     server_addr: SocketAddr,
     keypair: ClientKeyPair,
-    ebpf: EbpfAccelerator,
     status: ConnectionStatus,
 ) -> Result<()> {
     let local_addr = proxy_cfg.resolved_local_addr()?;
@@ -746,9 +968,7 @@ async fn handle_work_tcp(
     };
     enc_work.send_frame(&role.encode()?).await?;
 
-    let _ =
-        relay_encrypted_and_plain_with_status(enc_work, local_stream, Some(&ebpf), Some(&status))
-            .await?;
+    let _ = relay_encrypted_and_plain_with_status(enc_work, local_stream, Some(&status)).await?;
     Ok(())
 }
 

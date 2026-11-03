@@ -3,7 +3,6 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use crate::crypto::EncryptedStream;
-use crate::ebpf::EbpfAccelerator;
 use crate::net_utils::configure_tcp_stream;
 use crate::status::ConnectionStatus;
 
@@ -12,33 +11,22 @@ const RELAY_BUF_SIZE: usize = 64 * 1024;
 /// Relay data bidirectionally at maximum throughput between an `EncryptedStream<TcpStream>`
 /// (post-quantum mlkem768x25519plus tunnel) and a local or visitor `TcpStream`.
 ///
-/// Uses full-duplex split halves with pre-allocated 64 KiB buffers and registers the underlying
-/// socket descriptors with `EbpfAccelerator` when active.
+/// Uses full-duplex split halves with 64 KiB buffers.
 pub async fn relay_encrypted_and_plain(
     encrypted: EncryptedStream<TcpStream>,
     plain: TcpStream,
-    ebpf: Option<&EbpfAccelerator>,
 ) -> io::Result<(u64, u64)> {
-    relay_encrypted_and_plain_with_status(encrypted, plain, ebpf, None).await
+    relay_encrypted_and_plain_with_status(encrypted, plain, None).await
 }
 
 /// Same as [`relay_encrypted_and_plain`], with live traffic accounting.
 pub async fn relay_encrypted_and_plain_with_status(
     encrypted: EncryptedStream<TcpStream>,
     mut plain: TcpStream,
-    ebpf: Option<&EbpfAccelerator>,
     status: Option<&ConnectionStatus>,
 ) -> io::Result<(u64, u64)> {
     configure_tcp_stream(encrypted.get_ref());
     configure_tcp_stream(&plain);
-
-    #[cfg(unix)]
-    if let Some(accel) = ebpf {
-        use std::os::unix::io::AsRawFd;
-        if accel.is_active() {
-            let _ = accel.register_socket_pair(encrypted.get_ref().as_raw_fd(), plain.as_raw_fd());
-        }
-    }
 
     let (mut enc_read, mut enc_write) = encrypted.into_split();
     let (mut plain_read, mut plain_write) = plain.split();
@@ -82,23 +70,66 @@ pub async fn relay_encrypted_and_plain_with_status(
     tokio::try_join!(plain_to_enc, enc_to_plain)
 }
 
-/// Relay two plain `TcpStream` connections using Linux `splice(2)` zero-copy pipes (with eBPF
-/// `SOCKHASH` fast-path registration when available) and fallback to `tokio::io::copy_bidirectional`.
-pub async fn relay_plain_tcp_pair(
+/// Relay two plain `TcpStream`s with live traffic accounting (`a -> b` counts as sent,
+/// `b -> a` as received). Used by the tunnel data plane on the client, where both legs are
+/// plaintext inside the WireGuard tunnel.
+pub async fn relay_plain_with_status(
     mut a: TcpStream,
     mut b: TcpStream,
-    ebpf: Option<&EbpfAccelerator>,
+    status: Option<&ConnectionStatus>,
 ) -> io::Result<(u64, u64)> {
     configure_tcp_stream(&a);
     configure_tcp_stream(&b);
 
-    #[cfg(unix)]
-    if let Some(accel) = ebpf {
-        use std::os::unix::io::AsRawFd;
-        if accel.is_active() {
-            let _ = accel.register_socket_pair(a.as_raw_fd(), b.as_raw_fd());
+    let (mut a_read, mut a_write) = a.split();
+    let (mut b_read, mut b_write) = b.split();
+    let sent_status = status.cloned();
+    let received_status = status.cloned();
+
+    let a_to_b = async move {
+        let mut buf = vec![0u8; RELAY_BUF_SIZE];
+        let mut total = 0u64;
+        loop {
+            let n = a_read.read(&mut buf).await?;
+            if n == 0 {
+                let _ = b_write.shutdown().await;
+                break;
+            }
+            b_write.write_all(&buf[..n]).await?;
+            total += n as u64;
+            if let Some(status) = &sent_status {
+                status.record_sent(n);
+            }
         }
-    }
+        Ok::<u64, io::Error>(total)
+    };
+
+    let b_to_a = async move {
+        let mut buf = vec![0u8; RELAY_BUF_SIZE];
+        let mut total = 0u64;
+        loop {
+            let n = b_read.read(&mut buf).await?;
+            if n == 0 {
+                let _ = a_write.shutdown().await;
+                break;
+            }
+            a_write.write_all(&buf[..n]).await?;
+            total += n as u64;
+            if let Some(status) = &received_status {
+                status.record_received(n);
+            }
+        }
+        Ok::<u64, io::Error>(total)
+    };
+
+    tokio::try_join!(a_to_b, b_to_a)
+}
+
+/// Relay two plain `TcpStream` connections using Linux `splice(2)` zero-copy pipes and
+/// fallback to `tokio::io::copy_bidirectional`.
+pub async fn relay_plain_tcp_pair(mut a: TcpStream, mut b: TcpStream) -> io::Result<(u64, u64)> {
+    configure_tcp_stream(&a);
+    configure_tcp_stream(&b);
 
     #[cfg(target_os = "linux")]
     {

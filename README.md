@@ -113,6 +113,58 @@ rrp client
 rrp client -c /usr/local/etc/rrp/rrpc.toml -s 203.0.113.10:3700,198.51.100.20:3700
 ```
 
+## 4.1 内核隧道数据面（Linux 服务端 eBPF + WireGuard）
+
+服务端在 Linux 上以 root 运行且 `enable_ebpf = true`（默认）时，rrp 会尝试启用内核隧道数据面：
+
+- 服务端创建一个 WireGuard 接口（默认 `rrp-wg0`，UDP 端口 `3701`，由内核持有，无用户态进程监听），
+  并在公网网卡与该接口上挂载 TC eBPF 程序（源码 `bpf/rrp_tc.c`，预编译对象 `bpf/rrp_tc.o`）。
+- 访客流量到达 `公网IP:remote_port` 时，eBPF 程序按静态表改写目的地址为客户端隧道地址后直接送入
+  WireGuard 加密发往客户端；被代理的端口**不会出现任何用户态监听 socket**，服务端内存中也不会出现明文载荷。
+- 客户端（Linux，root）收到 `RegisterAck` 中的隧道参数后创建 `rrpc-wg<N>` 接口，在隧道地址上用普通 socket
+  监听并明文中继到本地服务，回包经策略路由回到隧道。访客真实 IP 在客户端可见。
+- WireGuard 的 PSK 由 mlkem768x25519plus 控制握手派生（后量子混合），每次控制会话轮换；X25519 节点密钥
+  复用 `rrp install` 生成的密钥，无需额外密钥管理。
+- 每个访客连接不再需要单独的 ML-KEM 握手和到服务端的新 TCP 连接。
+
+任一条件不满足（非 Linux、无 `CAP_NET_ADMIN`/`CAP_BPF`、缺少 `wireguard` 内核模块、内核低于 5.10、
+客户端或服务端任一方未启用）时自动回退到原有的用户态加密中继，`rrp status` 的 `eBPF:` 一行会说明原因。
+
+服务端 `rrps.toml` 可选配置（均有默认值）：
+
+```toml
+enable_ebpf = true
+
+[tunnel]
+interface = "rrp-wg0"          # WireGuard 接口名
+listen_port = 3701             # WireGuard UDP 端口（需在防火墙放行）
+# public_interface = "eth0"    # 默认取默认路由所在网卡
+# public_ipv4 = "203.0.113.10" # 默认取该网卡第一个非回环 IPv4
+# public_ipv6 = "2001:db8::1"  # 默认取该网卡第一个全局 IPv6
+ipv4_cidr = "10.199.0.0/16"    # 隧道地址池，首个地址为服务端
+ipv6_cidr = "fd00:7272::/64"
+mtu = 1420                     # eBPF 会据此钳制访客 SYN 的 MSS
+```
+
+客户端 `rrpc.toml`：
+
+```toml
+tunnel_mode = "auto"   # auto: 能用则用，失败回退中继；relay: 始终中继；tunnel: 必须隧道
+```
+
+限制：隧道模式下 `remote_bind_ip` 只用于选择地址族（填 IPv4 字面量则仅 IPv4，填 IPv6 则仅 IPv6），
+不再绑定到具体地址；服务端每个地址族只使用一个公网 IP 作为回包源地址；访客侧 IPv4/IPv6 互转由客户端
+中继完成，服务端 eBPF 只做同族转发。
+
+在 Linux 上核对隧道是否生效：
+
+```bash
+rrp status --mode server          # eBPF: active (TC redirect eth0 <-> rrp-wg0, ...)
+wg show rrp-wg0                   # 应看到客户端 peer 与最近握手时间
+tc filter show dev eth0 ingress   # 应看到 rrp_public_ingress
+ss -lntp | grep <remote_port>     # 应为空：端口没有用户态监听
+```
+
 ## 5. 查看运行状态
 
 ```bash
@@ -128,7 +180,7 @@ rrp status --json
 ```
 
 状态包含进程运行时长、各服务端/客户端连接时长、实时业务流量、最后心跳及客户端心跳 RTT。
-流量统计仅包含代理业务载荷，不包含加密和协议开销。
+流量统计仅包含代理业务载荷，不包含加密和协议开销；隧道模式下服务端的流量来自 eBPF 计数（含 IP/TCP 头）。
 
 运行时快照默认写入 Linux 的 `/run/rrp/`（无权限时回退到当前用户临时目录）或
 macOS 的 `/var/run/rrp/`。可为运行进程和查询命令同时设置 `RRP_STATUS_DIR`，

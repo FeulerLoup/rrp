@@ -49,7 +49,7 @@ struct RuntimeStatusInner {
     pid: u32,
     started_at_unix_ms: u64,
     listen_addr: Option<String>,
-    ebpf_status: String,
+    ebpf_status: RwLock<String>,
     counters: Arc<Counters>,
     connections: DashMap<String, Arc<ConnectionInner>>,
     next_connection_id: AtomicU64,
@@ -120,7 +120,7 @@ impl RuntimeStatus {
                 pid: std::process::id(),
                 started_at_unix_ms: now_unix_ms(),
                 listen_addr,
-                ebpf_status: ebpf_status.into(),
+                ebpf_status: RwLock::new(ebpf_status.into()),
                 counters: Arc::new(Counters::default()),
                 connections: DashMap::new(),
                 next_connection_id: AtomicU64::new(1),
@@ -130,6 +130,22 @@ impl RuntimeStatus {
 
     pub fn mode(&self) -> RunMode {
         self.inner.mode
+    }
+
+    /// Update the data-plane description shown by `rrp status` (the tunnel is brought up
+    /// after the process starts, so this is not known at construction time).
+    pub fn set_ebpf_status(&self, status: impl Into<String>) {
+        if let Ok(mut current) = self.inner.ebpf_status.write() {
+            *current = status.into();
+        }
+    }
+
+    pub fn ebpf_status(&self) -> String {
+        self.inner
+            .ebpf_status
+            .read()
+            .map(|value| value.clone())
+            .unwrap_or_default()
     }
 
     pub fn mark_offline(&self) {
@@ -268,7 +284,7 @@ impl RuntimeStatus {
             updated_at_unix_ms: now_ms,
             uptime_secs: elapsed_secs(self.inner.started_at_unix_ms, now_ms),
             listen_addr: self.inner.listen_addr.clone(),
-            ebpf_status: self.inner.ebpf_status.clone(),
+            ebpf_status: self.ebpf_status(),
             traffic: traffic_snapshot(global),
             connections,
         }
@@ -342,6 +358,28 @@ impl ConnectionStatus {
         self.global_counters
             .bytes_received
             .fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// Replace the absolute byte counters (used when the kernel data plane accounts traffic
+    /// and user space only samples the totals). Global counters receive the delta.
+    pub fn set_counters(&self, bytes_sent: u64, bytes_received: u64) {
+        let prev_sent = self
+            .inner
+            .counters
+            .bytes_sent
+            .swap(bytes_sent, Ordering::Relaxed);
+        let prev_received = self
+            .inner
+            .counters
+            .bytes_received
+            .swap(bytes_received, Ordering::Relaxed);
+        self.global_counters
+            .bytes_sent
+            .fetch_add(bytes_sent.saturating_sub(prev_sent), Ordering::Relaxed);
+        self.global_counters.bytes_received.fetch_add(
+            bytes_received.saturating_sub(prev_received),
+            Ordering::Relaxed,
+        );
     }
 }
 

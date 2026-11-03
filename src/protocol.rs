@@ -37,11 +37,60 @@ pub struct ProxySpec {
     pub remote_bind_ip: Option<String>,
 }
 
+/// Wire version of the tunnel (WireGuard + TC redirect) data plane negotiation.
+pub const TUNNEL_PROTOCOL_VERSION: u32 = 1;
+
+/// Client asks the server to serve its proxies through the kernel tunnel data plane instead
+/// of per-connection encrypted work connections.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TunnelRequest {
+    pub version: u32,
+}
+
+/// Server's tunnel parameters for one control session, carried in `RegisterAck`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TunnelAssignment {
+    pub version: u32,
+    /// Server WireGuard public key, base64 (standard alphabet, as `wg` prints it).
+    pub server_public_key: String,
+    /// UDP port of the server's WireGuard endpoint; the host is the control connection's peer.
+    pub endpoint_port: u16,
+    pub client_ipv4: String,
+    pub ipv4_prefix_len: u8,
+    pub client_ipv6: String,
+    pub ipv6_prefix_len: u8,
+    pub server_ipv4: String,
+    pub server_ipv6: String,
+    pub mtu: u16,
+}
+
+/// Ports on which the client listens inside the tunnel for one proxy, per address family.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TunnelBinding {
+    pub proxy_name: String,
+    #[serde(default)]
+    pub tcp_v4: Option<u16>,
+    #[serde(default)]
+    pub tcp_v6: Option<u16>,
+    #[serde(default)]
+    pub udp_v4: Option<u16>,
+    #[serde(default)]
+    pub udp_v6: Option<u16>,
+}
+
 /// First message sent by client after completing the mlkem768x25519plus handshake.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum RoleHandshake {
-    Control { proxies: Vec<ProxySpec> },
-    WorkTcp { conn_id: u64, proxy_name: String },
+    Control {
+        proxies: Vec<ProxySpec>,
+        /// Absent for clients that only speak the relay data plane.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tunnel: Option<TunnelRequest>,
+    },
+    WorkTcp {
+        conn_id: u64,
+        proxy_name: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -49,6 +98,10 @@ pub enum ControlSignal {
     RegisterAck {
         success: bool,
         message: String,
+        /// Present when the server accepted a `TunnelRequest`; the client must then bring
+        /// up the tunnel and answer with `TunnelReady`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tunnel: Option<TunnelAssignment>,
     },
     ReqWorkConn {
         conn_id: u64,
@@ -60,6 +113,15 @@ pub enum ControlSignal {
     },
     Pong {
         timestamp_ms: u64,
+    },
+    /// Client -> server: tunnel is up and these are the in-tunnel listener ports.
+    TunnelReady {
+        bindings: Vec<TunnelBinding>,
+    },
+    /// Server -> client: result of installing the port redirections.
+    TunnelAck {
+        success: bool,
+        message: String,
     },
 }
 

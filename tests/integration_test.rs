@@ -20,14 +20,19 @@ use rrp::crypto::{
 };
 use rrp::ebpf::EbpfAccelerator;
 use rrp::net_utils::{bind_tcp_listener, bind_udp_socket, connect_tcp};
-use rrp::protocol::{ControlSignal, ProxySpec, RoleHandshake, TunnelFrame};
+use rrp::protocol::{
+    ControlSignal, ProxySpec, RoleHandshake, TunnelAssignment, TunnelBinding, TunnelFrame,
+    TunnelRequest, TUNNEL_PROTOCOL_VERSION,
+};
 use rrp::relay::relay_plain_tcp_pair;
+use rrp::server::resolve_tunnel_bindings;
 use rrp::server::Server;
 use rrp::service::{
     extract_config_path_from_service, install_autostart_service, uninstall_autostart_service,
     uninstall_rrp, ServicePlatform,
 };
 use rrp::status::{RuntimeStatus, StatusReporter};
+use rrp::tunnel::plain_relay::start_tunnel_listeners;
 
 fn get_free_port(bind_ip: &str) -> u16 {
     let addr = if bind_ip.contains(':') {
@@ -386,6 +391,7 @@ async fn test_tcp_udp_and_all_forwarding() {
         authorized_keys: vec![pub_b64],
         enable_ebpf: true,
         heartbeat_timeout_secs: 60,
+        ..Default::default()
     };
 
     let server = Server::new(server_cfg).unwrap();
@@ -543,6 +549,7 @@ async fn test_ipv4_ipv6_cross_translation() {
         authorized_keys: vec![pub_b64],
         enable_ebpf: true,
         heartbeat_timeout_secs: 60,
+        ..Default::default()
     };
 
     let server = Server::new(server_cfg).unwrap();
@@ -653,6 +660,7 @@ async fn test_unapproved_client_rejected() {
         authorized_keys: vec![approved_pub],
         enable_ebpf: false,
         heartbeat_timeout_secs: 30,
+        ..Default::default()
     };
 
     let server = Server::new(server_cfg).unwrap();
@@ -689,13 +697,10 @@ async fn test_ebpf_and_zero_copy_splice_relay() {
     let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_addr = proxy_listener.local_addr().unwrap();
 
-    let ebpf_clone = ebpf_auto.clone();
     let relay_task = tokio::spawn(async move {
         let (inbound, _) = proxy_listener.accept().await.unwrap();
         let outbound = TcpStream::connect(echo_addr).await.unwrap();
-        relay_plain_tcp_pair(inbound, outbound, Some(&ebpf_clone))
-            .await
-            .unwrap()
+        relay_plain_tcp_pair(inbound, outbound).await.unwrap()
     });
 
     let mut client = TcpStream::connect(proxy_addr).await.unwrap();
@@ -845,6 +850,7 @@ async fn test_single_client_multiple_servers_concurrent_forwarding() {
         authorized_keys: vec![pub12.clone()],
         enable_ebpf: true,
         heartbeat_timeout_secs: 60,
+        ..Default::default()
     })
     .unwrap();
     let s1_addr = server1.local_addr();
@@ -858,6 +864,7 @@ async fn test_single_client_multiple_servers_concurrent_forwarding() {
         authorized_keys: vec![pub12],
         enable_ebpf: true,
         heartbeat_timeout_secs: 60,
+        ..Default::default()
     })
     .unwrap();
     let s2_addr = format!("[::1]:{}", server2.local_addr().port());
@@ -871,6 +878,7 @@ async fn test_single_client_multiple_servers_concurrent_forwarding() {
         authorized_keys: vec![pub3],
         enable_ebpf: true,
         heartbeat_timeout_secs: 60,
+        ..Default::default()
     })
     .unwrap();
     let s3_addr = server3.local_addr();
@@ -1026,6 +1034,7 @@ async fn test_multi_server_fault_isolation_and_auto_reconnect() {
         authorized_keys: vec![pub_b64.clone()],
         enable_ebpf: false,
         heartbeat_timeout_secs: 60,
+        ..Default::default()
     })
     .unwrap();
     let server_a_addr = server_a.local_addr();
@@ -1094,6 +1103,7 @@ async fn test_multi_server_fault_isolation_and_auto_reconnect() {
         authorized_keys: vec![pub_b64],
         enable_ebpf: false,
         heartbeat_timeout_secs: 60,
+        ..Default::default()
     })
     .unwrap();
     let server_b_handle = tokio::spawn(async move {
@@ -1295,6 +1305,7 @@ fn test_control_messages_never_span_multiple_frames() {
                 remote_bind_ip: None,
             })
             .collect(),
+        tunnel: None,
     };
     assert!(huge_registration.encode().is_err());
 }
@@ -1312,6 +1323,7 @@ async fn test_work_connection_cannot_be_claimed_by_another_client() {
         authorized_keys: vec![pub_a, pub_b],
         enable_ebpf: false,
         heartbeat_timeout_secs: 60,
+        ..Default::default()
     })
     .unwrap();
     let server_addr = server.local_addr().to_string();
@@ -1332,10 +1344,13 @@ async fn test_work_connection_cannot_be_claimed_by_another_client() {
             remote_port,
             remote_bind_ip: None,
         }],
+        tunnel: None,
     };
     ctrl.send_frame(&role.encode().unwrap()).await.unwrap();
     match TunnelFrame::decode(ctrl.recv_frame().await.unwrap().unwrap()).unwrap() {
-        TunnelFrame::Signal(ControlSignal::RegisterAck { success, message }) => {
+        TunnelFrame::Signal(ControlSignal::RegisterAck {
+            success, message, ..
+        }) => {
             assert!(success, "{message}");
         }
         other => panic!("unexpected frame {other:?}"),
@@ -1412,4 +1427,343 @@ async fn test_work_connection_cannot_be_claimed_by_another_client() {
     assert_eq!(&got[..], b"only-for-client-a");
 
     server_handle.abort();
+}
+
+#[test]
+fn test_control_protocol_stays_compatible_with_relay_only_peers() {
+    // A pre-tunnel client sends Control without the `tunnel` field.
+    let legacy_control = br#"{"Control":{"proxies":[{"name":"web","proxy_type":"tcp","local_addr":"127.0.0.1:80","remote_port":8080,"remote_bind_ip":null}]}}"#;
+    match RoleHandshake::decode(legacy_control).unwrap() {
+        RoleHandshake::Control { proxies, tunnel } => {
+            assert_eq!(proxies.len(), 1);
+            assert!(tunnel.is_none());
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+
+    // A pre-tunnel server answers RegisterAck without the `tunnel` field.
+    let mut legacy_ack = vec![0x01u8];
+    legacy_ack.extend_from_slice(br#"{"RegisterAck":{"success":true,"message":"registered"}}"#);
+    match TunnelFrame::decode(legacy_ack.into()).unwrap() {
+        TunnelFrame::Signal(ControlSignal::RegisterAck {
+            success, tunnel, ..
+        }) => {
+            assert!(success);
+            assert!(tunnel.is_none());
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+
+    // A relay-only client never puts `tunnel` on the wire, so old servers parse it unchanged.
+    let relay_control = RoleHandshake::Control {
+        proxies: vec![],
+        tunnel: None,
+    };
+    let encoded = String::from_utf8(relay_control.encode().unwrap()).unwrap();
+    assert!(!encoded.contains("tunnel"), "{encoded}");
+
+    // New messages round-trip.
+    let assignment = TunnelAssignment {
+        version: TUNNEL_PROTOCOL_VERSION,
+        server_public_key: "c2VydmVy".to_string(),
+        endpoint_port: 3701,
+        client_ipv4: "10.199.0.2".to_string(),
+        ipv4_prefix_len: 16,
+        client_ipv6: "fd00:7272::2".to_string(),
+        ipv6_prefix_len: 64,
+        server_ipv4: "10.199.0.1".to_string(),
+        server_ipv6: "fd00:7272::1".to_string(),
+        mtu: 1420,
+    };
+    let ack = TunnelFrame::Signal(ControlSignal::RegisterAck {
+        success: true,
+        message: "registered (tunnel data plane)".to_string(),
+        tunnel: Some(assignment.clone()),
+    });
+    match TunnelFrame::decode(ack.encode().unwrap()).unwrap() {
+        TunnelFrame::Signal(ControlSignal::RegisterAck { tunnel, .. }) => {
+            assert_eq!(tunnel, Some(assignment));
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+    let request = RoleHandshake::Control {
+        proxies: vec![],
+        tunnel: Some(TunnelRequest {
+            version: TUNNEL_PROTOCOL_VERSION,
+        }),
+    };
+    match RoleHandshake::decode(&request.encode().unwrap()).unwrap() {
+        RoleHandshake::Control { tunnel, .. } => assert_eq!(tunnel.map(|t| t.version), Some(1)),
+        other => panic!("unexpected {other:?}"),
+    }
+    let ready = TunnelFrame::Signal(ControlSignal::TunnelReady {
+        bindings: vec![TunnelBinding {
+            proxy_name: "web".to_string(),
+            tcp_v4: Some(40001),
+            tcp_v6: Some(40002),
+            ..Default::default()
+        }],
+    });
+    match TunnelFrame::decode(ready.encode().unwrap()).unwrap() {
+        TunnelFrame::Signal(ControlSignal::TunnelReady { bindings }) => {
+            assert_eq!(bindings[0].tcp_v6, Some(40002));
+            assert_eq!(bindings[0].udp_v4, None);
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_handshake_derives_matching_tunnel_psk_on_both_ends() {
+    let (priv_b64, pub_b64) = generate_keypair();
+    let client_kp = ClientKeyPair::from_base64(&priv_b64).unwrap();
+    let authorizer = rrp::crypto::ServerAuthorizer::new(&[pub_b64]).unwrap();
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+
+    let client =
+        tokio::spawn(async move { client_handshake(client_io, &client_kp).await.unwrap() });
+    let server = tokio::spawn(async move {
+        rrp::crypto::server_handshake(server_io, &authorizer)
+            .await
+            .unwrap()
+            .0
+    });
+    let (client_stream, server_stream) = (client.await.unwrap(), server.await.unwrap());
+
+    let psk = client_stream.tunnel_psk();
+    assert_eq!(psk, server_stream.tunnel_psk());
+    assert_ne!(psk, [0u8; 32], "PSK must be derived, not left blank");
+
+    // The X25519 half of the client key is what the server will configure as the WireGuard peer.
+    let kp = ClientKeyPair::from_base64(&priv_b64).unwrap();
+    let approved = AuthorizedPublicKey::from_base64(&kp.public_key_base64()).unwrap();
+    assert_eq!(kp.x25519_public_bytes(), approved.x25519_public_bytes());
+    assert_eq!(
+        x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(kp.x25519_private_bytes()))
+            .to_bytes(),
+        kp.x25519_public_bytes()
+    );
+}
+
+#[test]
+fn test_resolve_tunnel_bindings_matches_ports_per_family() {
+    let specs = vec![
+        ProxySpec {
+            name: "both".to_string(),
+            proxy_type: ProxyType::All,
+            local_addr: "127.0.0.1:1".to_string(),
+            remote_port: 18080,
+            remote_bind_ip: None,
+        },
+        ProxySpec {
+            name: "v4only".to_string(),
+            proxy_type: ProxyType::Udp,
+            local_addr: "127.0.0.1:1".to_string(),
+            remote_port: 15353,
+            remote_bind_ip: Some("0.0.0.0".to_string()),
+        },
+        ProxySpec {
+            name: "v6only".to_string(),
+            proxy_type: ProxyType::Tcp,
+            local_addr: "127.0.0.1:1".to_string(),
+            remote_port: 19000,
+            remote_bind_ip: Some("[::1]".to_string()),
+        },
+    ];
+    let bindings = vec![
+        TunnelBinding {
+            proxy_name: "both".to_string(),
+            tcp_v4: Some(1),
+            tcp_v6: Some(2),
+            udp_v4: Some(3),
+            udp_v6: Some(4),
+        },
+        TunnelBinding {
+            proxy_name: "v4only".to_string(),
+            udp_v4: Some(5),
+            udp_v6: Some(6),
+            ..Default::default()
+        },
+        TunnelBinding {
+            proxy_name: "v6only".to_string(),
+            tcp_v6: Some(7),
+            ..Default::default()
+        },
+    ];
+    let resolved = resolve_tunnel_bindings(&specs, &bindings).unwrap();
+    let summary: Vec<(String, u8, u8, u16, u16)> = resolved
+        .iter()
+        .map(|r| {
+            (
+                r.proxy_name.clone(),
+                r.family,
+                r.proto,
+                r.public_port,
+                r.tunnel_port,
+            )
+        })
+        .collect();
+    assert_eq!(
+        summary,
+        vec![
+            ("both".to_string(), 4, 6, 18080, 1),
+            ("both".to_string(), 4, 17, 18080, 3),
+            ("both".to_string(), 6, 6, 18080, 2),
+            ("both".to_string(), 6, 17, 18080, 4),
+            ("v4only".to_string(), 4, 17, 15353, 5),
+            ("v4only".to_string(), 6, 17, 15353, 6),
+            ("v6only".to_string(), 6, 6, 19000, 7),
+        ]
+    );
+
+    // A missing port for a required family/protocol is an error, not a silent gap.
+    let incomplete = vec![TunnelBinding {
+        proxy_name: "both".to_string(),
+        tcp_v4: Some(1),
+        ..Default::default()
+    }];
+    let err = resolve_tunnel_bindings(&specs[..1], &incomplete)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("IPv4 UDP"), "{err}");
+    assert!(resolve_tunnel_bindings(&specs, &[]).is_err());
+}
+
+#[tokio::test]
+async fn test_tunnel_listeners_relay_plaintext_to_local_services() {
+    // The in-tunnel listeners are plain sockets bound to the client's tunnel addresses; using
+    // the loopback addresses as stand-ins exercises the whole client data plane without a kernel.
+    let tcp_echo = spawn_tcp_echo_server("127.0.0.1:0").await;
+    let udp_echo = spawn_udp_echo_server("[::1]:0").await;
+    let proxies = vec![
+        ProxyConfig {
+            name: "tcp_proxy".to_string(),
+            proxy_type: ProxyType::Tcp,
+            local_addr: Some(tcp_echo.to_string()),
+            remote_port: 18080,
+            ..Default::default()
+        },
+        ProxyConfig {
+            name: "udp_proxy".to_string(),
+            proxy_type: ProxyType::Udp,
+            local_addr: Some(udp_echo.to_string()),
+            remote_port: 15353,
+            remote_bind_ip: Some("127.0.0.1".to_string()),
+            ..Default::default()
+        },
+    ];
+    let runtime = RuntimeStatus::new(RunMode::Client, "test", None);
+    let status = runtime.proxy_endpoint("tcp_proxy", "tcp_proxy", "tcp", "x", "y");
+    let listeners = start_tunnel_listeners(
+        "127.0.0.1".parse().unwrap(),
+        "::1".parse().unwrap(),
+        &proxies,
+        |name| (name == "tcp_proxy").then(|| status.clone()),
+    )
+    .await
+    .unwrap();
+
+    let tcp = listeners
+        .bindings
+        .iter()
+        .find(|b| b.proxy_name == "tcp_proxy")
+        .unwrap();
+    assert!(tcp.tcp_v4.is_some() && tcp.tcp_v6.is_some());
+    assert!(tcp.udp_v4.is_none() && tcp.udp_v6.is_none());
+    let udp = listeners
+        .bindings
+        .iter()
+        .find(|b| b.proxy_name == "udp_proxy")
+        .unwrap();
+    assert!(
+        udp.udp_v4.is_some(),
+        "IPv4-only bind ip keeps the v4 listener"
+    );
+    assert!(
+        udp.udp_v6.is_none(),
+        "IPv4-only bind ip drops the v6 listener"
+    );
+
+    // IPv6 visitor -> IPv4 local service over the TCP listener.
+    let mut visitor = TcpStream::connect(format!("[::1]:{}", tcp.tcp_v6.unwrap()))
+        .await
+        .unwrap();
+    let payload: Vec<u8> = (0..150_000).map(|i| (i % 253) as u8).collect();
+    visitor.write_all(&payload).await.unwrap();
+    let mut echoed = vec![0u8; payload.len()];
+    visitor.read_exact(&mut echoed).await.unwrap();
+    assert_eq!(echoed, payload);
+    assert!(runtime.snapshot().traffic.total_bytes >= 300_000);
+
+    // IPv4 visitor -> IPv6 local service over the UDP listener.
+    let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    sock.send_to(b"ping", format!("127.0.0.1:{}", udp.udp_v4.unwrap()))
+        .await
+        .unwrap();
+    let mut buf = [0u8; 64];
+    let (n, _) = tokio::time::timeout(Duration::from_secs(5), sock.recv_from(&mut buf))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&buf[..n], b"udp-echo:ping");
+
+    // Dropping the set stops the listeners.
+    let port = tcp.tcp_v4.unwrap();
+    drop(listeners);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(TcpStream::connect(format!("127.0.0.1:{port}"))
+        .await
+        .is_err());
+}
+
+#[test]
+fn test_tunnel_config_parsing_and_validation() {
+    let server_toml = r#"
+bind_addr = "[::]:3700"
+enable_ebpf = true
+
+[tunnel]
+interface = "rrp-wg0"
+listen_port = 3701
+public_interface = "eth0"
+ipv4_cidr = "10.77.0.0/24"
+ipv6_cidr = "fd00:77::/64"
+mtu = 1400
+"#;
+    let cfg: ServerConfig = toml::from_str(server_toml).unwrap();
+    cfg.validate().unwrap();
+    assert_eq!(cfg.tunnel.public_interface.as_deref(), Some("eth0"));
+    assert_eq!(cfg.tunnel.mtu, 1400);
+    assert_eq!(cfg.tunnel.public_ipv4, None);
+
+    // Defaults apply when the section is absent, and the default server config validates.
+    let bare: ServerConfig = toml::from_str("bind_addr = \"127.0.0.1:3700\"").unwrap();
+    assert_eq!(bare.tunnel, rrp::config::TunnelServerConfig::default());
+    bare.validate().unwrap();
+
+    let mut bad = ServerConfig::default();
+    bad.tunnel.ipv4_cidr = "10.0.0.0/31".to_string();
+    assert!(bad.validate().is_err());
+    let mut bad = ServerConfig::default();
+    bad.tunnel.mtu = 1000;
+    assert!(bad.validate().is_err());
+    let mut bad = ServerConfig::default();
+    bad.tunnel.public_ipv4 = Some("fd00::1".to_string());
+    assert!(bad.validate().is_err());
+    let mut bad = ServerConfig::default();
+    bad.tunnel.interface = "a-name-that-is-far-too-long".to_string();
+    assert!(bad.validate().is_err());
+
+    let (priv_b64, _) = generate_keypair();
+    let client_toml = format!(
+        "server_addr = \"10.0.0.1:3700\"\nprivate_key = \"{priv_b64}\"\ntunnel_mode = \"relay\"\n"
+    );
+    let cfg: ClientConfig = toml::from_str(&client_toml).unwrap();
+    assert_eq!(cfg.tunnel_mode, rrp::config::TunnelMode::Relay);
+    cfg.validate().unwrap();
+    let default_cfg: ClientConfig = toml::from_str(&format!(
+        "server_addr = \"10.0.0.1:3700\"\nprivate_key = \"{priv_b64}\"\n"
+    ))
+    .unwrap();
+    assert_eq!(default_cfg.tunnel_mode, rrp::config::TunnelMode::Auto);
 }

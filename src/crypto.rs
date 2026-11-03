@@ -154,6 +154,15 @@ impl ClientKeyPair {
     pub fn key_id(&self) -> &KeyId {
         &self.key_id
     }
+
+    /// Raw X25519 private key: doubles as the WireGuard node key in tunnel mode.
+    pub fn x25519_private_bytes(&self) -> [u8; 32] {
+        self.x25519_sk.to_bytes()
+    }
+
+    pub fn x25519_public_bytes(&self) -> [u8; 32] {
+        *self.x25519_pk.as_bytes()
+    }
 }
 
 impl AuthorizedPublicKey {
@@ -197,6 +206,11 @@ impl AuthorizedPublicKey {
     pub fn to_base64(&self) -> String {
         URL_SAFE_NO_PAD.encode(&self.raw_bytes)
     }
+
+    /// The client's X25519 public key, which is also its WireGuard peer key in tunnel mode.
+    pub fn x25519_public_bytes(&self) -> [u8; 32] {
+        *self.x25519_pk.as_bytes()
+    }
 }
 
 #[derive(Clone, Default)]
@@ -225,6 +239,18 @@ impl ServerAuthorizer {
     }
 }
 
+/// Keys derived from one mlkem768x25519plus handshake.
+struct SessionKeys {
+    c2s_key: [u8; 32],
+    s2c_key: [u8; 32],
+    server_verify: [u8; 32],
+    client_verify: [u8; 32],
+    /// WireGuard preshared key for the tunnel data plane. Mixing the ML-KEM shared secret
+    /// into WireGuard's PSK slot is the standard way to make a WireGuard tunnel
+    /// post-quantum hybrid; it is fresh for every control session.
+    tunnel_psk: [u8; 32],
+}
+
 /// Derive directional ChaCha20-Poly1305 keys and verify tokens using HKDF-SHA256
 /// combining ML-KEM-768 shared secret, static-ephemeral X25519 shared secret,
 /// and ephemeral-ephemeral X25519 shared secret (mlkem768x25519plus design).
@@ -235,7 +261,7 @@ fn derive_session_keys(
     client_nonce: &[u8; 32],
     server_nonce: &[u8; 32],
     key_id: &KeyId,
-) -> ([u8; 32], [u8; 32], [u8; 32], [u8; 32]) {
+) -> SessionKeys {
     let mut ikm = Vec::with_capacity(32 * 3);
     ikm.extend_from_slice(ss_kem);
     ikm.extend_from_slice(ss_static);
@@ -248,21 +274,32 @@ fn derive_session_keys(
 
     let hk = Hkdf::<Sha256>::new(Some(&salt), &ikm);
 
-    let mut c2s_key = [0u8; 32];
-    let mut s2c_key = [0u8; 32];
-    let mut server_verify = [0u8; 32];
-    let mut client_verify = [0u8; 32];
+    let mut keys = SessionKeys {
+        c2s_key: [0u8; 32],
+        s2c_key: [0u8; 32],
+        server_verify: [0u8; 32],
+        client_verify: [0u8; 32],
+        tunnel_psk: [0u8; 32],
+    };
 
-    hk.expand(b"rrp-mlkem768x25519plus-c2s-key", &mut c2s_key)
+    hk.expand(b"rrp-mlkem768x25519plus-c2s-key", &mut keys.c2s_key)
         .expect("hkdf expand c2s_key");
-    hk.expand(b"rrp-mlkem768x25519plus-s2c-key", &mut s2c_key)
+    hk.expand(b"rrp-mlkem768x25519plus-s2c-key", &mut keys.s2c_key)
         .expect("hkdf expand s2c_key");
-    hk.expand(b"rrp-mlkem768x25519plus-server-verify", &mut server_verify)
-        .expect("hkdf expand server_verify");
-    hk.expand(b"rrp-mlkem768x25519plus-client-verify", &mut client_verify)
-        .expect("hkdf expand client_verify");
+    hk.expand(
+        b"rrp-mlkem768x25519plus-server-verify",
+        &mut keys.server_verify,
+    )
+    .expect("hkdf expand server_verify");
+    hk.expand(
+        b"rrp-mlkem768x25519plus-client-verify",
+        &mut keys.client_verify,
+    )
+    .expect("hkdf expand client_verify");
+    hk.expand(b"rrp-mlkem768x25519plus-tunnel-psk", &mut keys.tunnel_psk)
+        .expect("hkdf expand tunnel_psk");
 
-    (c2s_key, s2c_key, server_verify, client_verify)
+    keys
 }
 
 fn current_unix_secs() -> u64 {
@@ -366,13 +403,19 @@ where
     let mut server_nonce = [0u8; 32];
     server_nonce.copy_from_slice(server_nonce_slice);
 
-    let (c2s_key, s2c_key, expected_server_verify, client_verify) = derive_session_keys(
+    let keys = derive_session_keys(
         ss_kem.as_slice(),
         ss_static.as_bytes(),
         ss_eph.as_bytes(),
         &client_nonce,
         &server_nonce,
         &keypair.key_id,
+    );
+    let (c2s_key, s2c_key, expected_server_verify, client_verify) = (
+        keys.c2s_key,
+        keys.s2c_key,
+        keys.server_verify,
+        keys.client_verify,
     );
 
     let s2c_cipher = ChaCha20Poly1305::new(Key::from_slice(&s2c_key));
@@ -400,7 +443,7 @@ where
     stream.write_all(&finish_msg).await?;
     stream.flush().await?;
 
-    Ok(EncryptedStream::new(stream, c2s_cipher, s2c_cipher))
+    Ok(EncryptedStream::new(stream, c2s_cipher, s2c_cipher).with_tunnel_psk(keys.tunnel_psk))
 }
 
 /// Perform server-side mlkem768x25519plus post-quantum handshake and authenticate client.
@@ -489,13 +532,19 @@ where
     let mut server_nonce = [0u8; 32];
     rng.fill_bytes(&mut server_nonce);
 
-    let (c2s_key, s2c_key, server_verify, expected_client_verify) = derive_session_keys(
+    let keys = derive_session_keys(
         ss_kem.as_slice(),
         ss_static.as_bytes(),
         ss_eph.as_bytes(),
         &client_nonce,
         &server_nonce,
         &key_id,
+    );
+    let (c2s_key, s2c_key, server_verify, expected_client_verify) = (
+        keys.c2s_key,
+        keys.s2c_key,
+        keys.server_verify,
+        keys.client_verify,
     );
 
     let s2c_cipher = ChaCha20Poly1305::new(Key::from_slice(&s2c_key));
@@ -555,7 +604,10 @@ where
         bail!("ClientFinish verification token mismatch");
     }
 
-    Ok((EncryptedStream::new(stream, s2c_cipher, c2s_cipher), key_id))
+    Ok((
+        EncryptedStream::new(stream, s2c_cipher, c2s_cipher).with_tunnel_psk(keys.tunnel_psk),
+        key_id,
+    ))
 }
 
 /// High-performance AEAD encrypted stream supporting both framed messages and `AsyncRead`/`AsyncWrite`.
@@ -568,6 +620,7 @@ pub struct EncryptedStream<S> {
     read_wire_buf: BytesMut,
     read_plain_buf: BytesMut,
     write_wire_buf: BytesMut,
+    tunnel_psk: [u8; 32],
 }
 
 impl<S> EncryptedStream<S> {
@@ -584,7 +637,19 @@ impl<S> EncryptedStream<S> {
             read_wire_buf: BytesMut::new(),
             read_plain_buf: BytesMut::new(),
             write_wire_buf: BytesMut::new(),
+            tunnel_psk: [0u8; 32],
         }
+    }
+
+    fn with_tunnel_psk(mut self, psk: [u8; 32]) -> Self {
+        self.tunnel_psk = psk;
+        self
+    }
+
+    /// Preshared key for a WireGuard tunnel bound to this control session. Both ends derive
+    /// the same value from the handshake secrets, so it never travels over the network.
+    pub fn tunnel_psk(&self) -> [u8; 32] {
+        self.tunnel_psk
     }
 
     pub fn into_inner(self) -> S {

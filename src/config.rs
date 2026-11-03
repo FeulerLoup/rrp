@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::crypto::{generate_keypair, AuthorizedPublicKey, ClientKeyPair};
 use crate::net_utils::split_host_port;
+use crate::tunnel::ipam::{Cidr4, Cidr6};
 
 /// Private keys live in the client config, so it must never be world-readable.
 #[cfg(unix)]
@@ -251,6 +252,91 @@ fn check_remote_port_conflicts(endpoint: &ResolvedServerConfig) -> Result<()> {
     Ok(())
 }
 
+/// Server-side settings for the kernel tunnel data plane (TC eBPF redirect + WireGuard).
+/// Only used when `enable_ebpf = true` on a Linux server with CAP_NET_ADMIN/CAP_BPF.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct TunnelServerConfig {
+    /// Name of the WireGuard interface rrp creates and owns.
+    pub interface: String,
+    /// UDP port the kernel WireGuard endpoint listens on.
+    pub listen_port: u16,
+    /// Interface that receives visitor traffic; auto-detected from the default route if unset.
+    pub public_interface: Option<String>,
+    /// Public IPv4/IPv6 used as the source of replies; auto-detected from the interface if unset.
+    pub public_ipv4: Option<String>,
+    pub public_ipv6: Option<String>,
+    /// Address pools for tunnel endpoints; the first host is the server, the rest are clients.
+    pub ipv4_cidr: String,
+    pub ipv6_cidr: String,
+    /// MTU of the WireGuard interface; the TC program clamps visitor MSS to fit.
+    pub mtu: u16,
+}
+
+impl Default for TunnelServerConfig {
+    fn default() -> Self {
+        Self {
+            interface: "rrp-wg0".to_string(),
+            listen_port: 3701,
+            public_interface: None,
+            public_ipv4: None,
+            public_ipv6: None,
+            ipv4_cidr: "10.199.0.0/16".to_string(),
+            ipv6_cidr: "fd00:7272::/64".to_string(),
+            mtu: 1420,
+        }
+    }
+}
+
+impl TunnelServerConfig {
+    pub fn validate(&self) -> Result<()> {
+        let name = self.interface.trim();
+        if name.is_empty() || name.len() > 15 || name.contains(['/', ' ']) {
+            bail!(
+                "tunnel.interface '{}' is not a valid Linux interface name",
+                self.interface
+            );
+        }
+        if self.listen_port == 0 {
+            bail!("tunnel.listen_port cannot be 0");
+        }
+        if !(1280..=9000).contains(&self.mtu) {
+            bail!("tunnel.mtu {} must be between 1280 and 9000", self.mtu);
+        }
+        let v4 = Cidr4::parse(&self.ipv4_cidr)
+            .with_context(|| format!("tunnel.ipv4_cidr '{}' is invalid", self.ipv4_cidr))?;
+        if v4.host_capacity() < 2 {
+            bail!(
+                "tunnel.ipv4_cidr '{}' has no room for clients",
+                self.ipv4_cidr
+            );
+        }
+        Cidr6::parse(&self.ipv6_cidr)
+            .with_context(|| format!("tunnel.ipv6_cidr '{}' is invalid", self.ipv6_cidr))?;
+        if let Some(ip) = &self.public_ipv4 {
+            let parsed = validate_ip_literal(ip, "tunnel.public_ipv4")?;
+            if !parsed.is_ipv4() {
+                bail!("tunnel.public_ipv4 '{}' is not an IPv4 address", ip);
+            }
+        }
+        if let Some(ip) = &self.public_ipv6 {
+            let parsed = validate_ip_literal(ip, "tunnel.public_ipv6")?;
+            if !parsed.is_ipv6() {
+                bail!("tunnel.public_ipv6 '{}' is not an IPv6 address", ip);
+            }
+        }
+        if let Some(iface) = &self.public_interface {
+            if iface.trim().is_empty() || iface.len() > 15 {
+                bail!(
+                    "tunnel.public_interface '{}' is not a valid interface name",
+                    iface
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerConfig {
     #[serde(default = "default_server_bind_addr")]
@@ -259,10 +345,14 @@ pub struct ServerConfig {
     pub proxy_bind_ip: String,
     #[serde(default)]
     pub authorized_keys: Vec<String>,
+    /// Enable the kernel tunnel data plane (TC eBPF redirect into a WireGuard interface).
+    /// Falls back to the user-space relay when unavailable.
     #[serde(default = "default_true")]
     pub enable_ebpf: bool,
     #[serde(default = "default_heartbeat_timeout_secs")]
     pub heartbeat_timeout_secs: u64,
+    #[serde(default)]
+    pub tunnel: TunnelServerConfig,
 }
 
 fn default_server_bind_addr() -> String {
@@ -289,6 +379,7 @@ impl Default for ServerConfig {
             authorized_keys: Vec::new(),
             enable_ebpf: true,
             heartbeat_timeout_secs: default_heartbeat_timeout_secs(),
+            tunnel: TunnelServerConfig::default(),
         }
     }
 }
@@ -323,6 +414,7 @@ impl ServerConfig {
         for key in &self.authorized_keys {
             AuthorizedPublicKey::from_base64(key)?;
         }
+        self.tunnel.validate()?;
         Ok(())
     }
 
@@ -395,6 +487,29 @@ fn add_proxy_to_endpoint(endpoint: &mut ResolvedServerConfig, proxy: &ProxyConfi
     Ok(())
 }
 
+/// Which data plane the client asks for.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TunnelMode {
+    /// Use the kernel tunnel when this host supports it and the server offers it, else relay.
+    #[default]
+    Auto,
+    /// Never use the tunnel; always relay through encrypted work connections.
+    Relay,
+    /// Require the tunnel; fail instead of silently relaying.
+    Tunnel,
+}
+
+impl TunnelMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TunnelMode::Auto => "auto",
+            TunnelMode::Relay => "relay",
+            TunnelMode::Tunnel => "tunnel",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClientConfig {
     /// Primary server address (supports single address or comma-separated addresses).
@@ -412,6 +527,10 @@ pub struct ClientConfig {
     pub enable_ebpf: bool,
     #[serde(default = "default_heartbeat_interval_secs")]
     pub heartbeat_interval_secs: u64,
+    /// `auto` (default), `relay`, or `tunnel`. The tunnel needs Linux with CAP_NET_ADMIN and
+    /// a server running with `enable_ebpf = true`.
+    #[serde(default)]
+    pub tunnel_mode: TunnelMode,
     #[serde(default)]
     pub proxies: Vec<ProxyConfig>,
 }
@@ -433,6 +552,7 @@ impl Default for ClientConfig {
             private_key: String::new(),
             enable_ebpf: true,
             heartbeat_interval_secs: default_heartbeat_interval_secs(),
+            tunnel_mode: TunnelMode::Auto,
             proxies: vec![ProxyConfig {
                 name: "example_tcp".to_string(),
                 proxy_type: ProxyType::Tcp,
@@ -669,6 +789,9 @@ impl ClientConfig {
 
     pub fn validate(&self) -> Result<()> {
         let _ = self.resolve_servers()?;
+        if self.tunnel_mode == TunnelMode::Tunnel && !cfg!(target_os = "linux") {
+            bail!("tunnel_mode = \"tunnel\" requires a Linux client (use \"auto\" or \"relay\")");
+        }
         Ok(())
     }
 }

@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -10,6 +10,7 @@ use dashmap::DashMap;
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, oneshot, watch};
+use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout};
 use tracing::{debug, info, warn};
 
@@ -20,9 +21,14 @@ use crate::ebpf::EbpfAccelerator;
 use crate::net_utils::{
     bind_tcp_listener, bind_udp_socket, format_bind_addr, normalize_socket_addr,
 };
-use crate::protocol::{ControlSignal, ProxySpec, RoleHandshake, TunnelFrame};
+use crate::protocol::{
+    ControlSignal, ProxySpec, RoleHandshake, TunnelBinding, TunnelFrame, TunnelRequest,
+    TUNNEL_PROTOCOL_VERSION,
+};
 use crate::relay::relay_encrypted_and_plain_with_status;
 use crate::status::{wait_for_shutdown_signal, ConnectionStatus, RuntimeStatus, StatusReporter};
+use crate::tunnel::bpf_types::{FAMILY_V4, FAMILY_V6, PROTO_TCP, PROTO_UDP};
+use crate::tunnel::{ResolvedBinding, TunnelLease, TunnelServer};
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const WORK_CONN_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -33,6 +39,8 @@ const UDP_OUTBOUND_QUEUE_LEN: usize = 1024;
 /// Pause after a transient `accept`/`recv_from` failure (e.g. EMFILE) so a persistent error does
 /// not turn into a hot loop that starves the rest of the runtime.
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
+/// How often kernel traffic counters are copied into `rrp status` for tunnel sessions.
+const TUNNEL_STATS_INTERVAL: Duration = Duration::from_secs(1);
 
 /// A visitor waiting for the client to open a matching work connection. The entry is bound to the
 /// client identity and proxy that requested it, so another authorized client cannot claim it.
@@ -48,10 +56,11 @@ type PendingWorkConnections = Arc<DashMap<u64, PendingWorkConn>>;
 struct ServerRuntime {
     config: Arc<ServerConfig>,
     authorizer: ServerAuthorizer,
-    ebpf: EbpfAccelerator,
     pending_work_conns: PendingWorkConnections,
     next_conn_id: Arc<AtomicU64>,
     status: RuntimeStatus,
+    /// Kernel tunnel data plane, when it came up successfully.
+    tunnel: Option<Arc<TunnelServer>>,
 }
 
 pub struct Server {
@@ -81,12 +90,12 @@ impl Server {
             .context("failed to query server local_addr")?;
         let status = RuntimeStatus::new(
             RunMode::Server,
-            ebpf.status_reason().to_string(),
+            ebpf.status_reason(),
             Some(local_addr.to_string()),
         );
 
         info!(
-            "rrp server listening on {} (ebpf: {})",
+            "rrp server listening on {} (data plane: {})",
             local_addr,
             ebpf.status_reason()
         );
@@ -115,14 +124,44 @@ impl Server {
         self.status.clone()
     }
 
+    /// Try to bring up the kernel tunnel data plane; on any failure keep serving with the
+    /// user-space relay and say why in the status output.
+    async fn start_tunnel(&self) -> Option<Arc<TunnelServer>> {
+        if !self.ebpf.enabled() {
+            return None;
+        }
+        match TunnelServer::start(&self.config.tunnel).await {
+            Ok(tunnel) => {
+                self.ebpf.set_active(tunnel.description());
+                self.status.set_ebpf_status(self.ebpf.status_reason());
+                Some(Arc::new(tunnel))
+            }
+            Err(error) => {
+                let reason = format!("{:#}", error);
+                if cfg!(target_os = "linux") {
+                    warn!(
+                        "kernel tunnel data plane unavailable, using user-space relay: {}",
+                        reason
+                    );
+                } else {
+                    debug!("kernel tunnel data plane unavailable: {}", reason);
+                }
+                self.ebpf.set_fallback(reason);
+                self.status.set_ebpf_status(self.ebpf.status_reason());
+                None
+            }
+        }
+    }
+
     pub async fn run(self) -> Result<()> {
+        let tunnel = self.start_tunnel().await;
         let runtime = ServerRuntime {
             config: Arc::new(self.config),
             authorizer: self.authorizer,
-            ebpf: self.ebpf,
             pending_work_conns: self.pending_work_conns,
             next_conn_id: self.next_conn_id,
             status: self.status,
+            tunnel,
         };
 
         loop {
@@ -203,14 +242,19 @@ async fn handle_incoming_connection(
             }
             Ok(())
         }
-        RoleHandshake::Control { proxies } => {
+        RoleHandshake::Control { proxies, tunnel } => {
             info!(
-                "authenticated client control connection from {} (key {}) with {} proxy rule(s)",
+                "authenticated client control connection from {} (key {}) with {} proxy rule(s){}",
                 peer_addr,
                 key_id_hex(&key_id),
-                proxies.len()
+                proxies.len(),
+                if tunnel.is_some() {
+                    ", tunnel requested"
+                } else {
+                    ""
+                }
             );
-            handle_control_session(enc_stream, peer_addr, key_id, proxies, runtime).await
+            handle_control_session(enc_stream, peer_addr, key_id, proxies, tunnel, runtime).await
         }
     }
 }
@@ -220,6 +264,7 @@ async fn handle_control_session(
     peer_addr: SocketAddr,
     key_id: KeyId,
     proxies: Vec<ProxySpec>,
+    tunnel_request: Option<TunnelRequest>,
     runtime: ServerRuntime,
 ) -> Result<()> {
     let mut proxy_statuses = HashMap::with_capacity(proxies.len());
@@ -259,6 +304,7 @@ async fn handle_control_session(
         peer_addr,
         key_id,
         proxies,
+        tunnel_request,
         runtime.clone(),
         proxy_statuses,
         statuses.clone(),
@@ -292,20 +338,10 @@ async fn bind_requested_proxies(
 ) -> Result<(Vec<(String, TcpListener)>, HashMap<String, Arc<UdpSocket>>)> {
     let mut tcp_listeners: Vec<(String, TcpListener)> = Vec::new();
     let mut udp_sockets: HashMap<String, Arc<UdpSocket>> = HashMap::new();
-    let mut seen_names: std::collections::HashSet<&str> = std::collections::HashSet::new();
+
+    validate_proxy_specs(enc_stream, proxies).await?;
 
     for proxy in proxies {
-        if !seen_names.insert(proxy.name.as_str()) {
-            let msg = format!("duplicate proxy name '{}' in registration", proxy.name);
-            reject_registration(enc_stream, &msg).await;
-            bail!("{}", msg);
-        }
-        if proxy.remote_port == 0 {
-            let msg = format!("proxy '{}' requested remote_port 0", proxy.name);
-            reject_registration(enc_stream, &msg).await;
-            bail!("{}", msg);
-        }
-
         let bind_ip = proxy.remote_bind_ip.as_deref().unwrap_or(default_bind_ip);
         let bind_addr = format_bind_addr(bind_ip, proxy.remote_port);
 
@@ -355,41 +391,201 @@ async fn bind_requested_proxies(
     Ok((tcp_listeners, udp_sockets))
 }
 
+async fn validate_proxy_specs(
+    enc_stream: &mut EncryptedStream<TcpStream>,
+    proxies: &[ProxySpec],
+) -> Result<()> {
+    let mut seen_names: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for proxy in proxies {
+        if !seen_names.insert(proxy.name.as_str()) {
+            let msg = format!("duplicate proxy name '{}' in registration", proxy.name);
+            reject_registration(enc_stream, &msg).await;
+            bail!("{}", msg);
+        }
+        if proxy.remote_port == 0 {
+            let msg = format!("proxy '{}' requested remote_port 0", proxy.name);
+            reject_registration(enc_stream, &msg).await;
+            bail!("{}", msg);
+        }
+    }
+    Ok(())
+}
+
 async fn reject_registration(enc_stream: &mut EncryptedStream<TcpStream>, message: &str) {
     let ack = TunnelFrame::Signal(ControlSignal::RegisterAck {
         success: false,
         message: message.to_string(),
+        tunnel: None,
     });
     if let Ok(bytes) = ack.encode() {
         let _ = enc_stream.send_frame(&bytes).await;
     }
 }
 
+/// State of one control session served through the kernel tunnel.
+struct TunnelSession {
+    server: Arc<TunnelServer>,
+    lease: TunnelLease,
+    installed: bool,
+    stats_task: Option<JoinHandle<()>>,
+}
+
+impl Drop for TunnelSession {
+    fn drop(&mut self) {
+        if let Some(task) = self.stats_task.take() {
+            task.abort();
+        }
+        self.server.remove_client(&self.lease);
+    }
+}
+
+/// Address families a proxy spec allows, derived from its `remote_bind_ip`.
+fn spec_families(spec: &ProxySpec) -> Vec<u8> {
+    match spec.remote_bind_ip.as_deref().map(|ip| {
+        ip.trim()
+            .trim_matches(|c| c == '[' || c == ']')
+            .parse::<IpAddr>()
+    }) {
+        Some(Ok(IpAddr::V4(ip))) if !ip.is_unspecified() => vec![FAMILY_V4],
+        Some(Ok(IpAddr::V6(ip))) if !ip.is_unspecified() => vec![FAMILY_V6],
+        _ => vec![FAMILY_V4, FAMILY_V6],
+    }
+}
+
+/// Match the client's reported in-tunnel ports against the registered proxies.
+pub fn resolve_tunnel_bindings(
+    proxies: &[ProxySpec],
+    bindings: &[TunnelBinding],
+) -> Result<Vec<ResolvedBinding>> {
+    let mut resolved = Vec::new();
+    for spec in proxies {
+        let binding = bindings
+            .iter()
+            .find(|b| b.proxy_name == spec.name)
+            .ok_or_else(|| anyhow!("client reported no tunnel ports for proxy '{}'", spec.name))?;
+        for family in spec_families(spec) {
+            if spec.proxy_type.has_tcp() {
+                let port = match family {
+                    FAMILY_V4 => binding.tcp_v4,
+                    _ => binding.tcp_v6,
+                };
+                let tunnel_port = port.ok_or_else(|| {
+                    anyhow!(
+                        "client reported no IPv{} TCP tunnel port for proxy '{}'",
+                        family,
+                        spec.name
+                    )
+                })?;
+                resolved.push(ResolvedBinding {
+                    proxy_name: spec.name.clone(),
+                    family,
+                    proto: PROTO_TCP,
+                    public_port: spec.remote_port,
+                    tunnel_port,
+                });
+            }
+            if spec.proxy_type.has_udp() {
+                let port = match family {
+                    FAMILY_V4 => binding.udp_v4,
+                    _ => binding.udp_v6,
+                };
+                let tunnel_port = port.ok_or_else(|| {
+                    anyhow!(
+                        "client reported no IPv{} UDP tunnel port for proxy '{}'",
+                        family,
+                        spec.name
+                    )
+                })?;
+                resolved.push(ResolvedBinding {
+                    proxy_name: spec.name.clone(),
+                    family,
+                    proto: PROTO_UDP,
+                    public_port: spec.remote_port,
+                    tunnel_port,
+                });
+            }
+        }
+    }
+    Ok(resolved)
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn handle_control_session_inner(
     mut enc_stream: EncryptedStream<TcpStream>,
     peer_addr: SocketAddr,
     key_id: KeyId,
     proxies: Vec<ProxySpec>,
+    tunnel_request: Option<TunnelRequest>,
     runtime: ServerRuntime,
     proxy_statuses: HashMap<String, ConnectionStatus>,
     statuses: Vec<ConnectionStatus>,
 ) -> Result<()> {
-    let (tcp_listeners, udp_sockets) =
-        bind_requested_proxies(&mut enc_stream, &proxies, &runtime.config.proxy_bind_ip).await?;
+    // Decide the data plane for this session. Any problem bringing the tunnel side up falls
+    // back to the relay so an old or misconfigured client still gets service.
+    let mut tunnel_session: Option<TunnelSession> = None;
+    let mut assignment = None;
+    if let (Some(request), Some(tunnel_server)) = (&tunnel_request, runtime.tunnel.as_ref()) {
+        if request.version != TUNNEL_PROTOCOL_VERSION {
+            warn!(
+                "client {} requested tunnel protocol version {}, server speaks {}; using relay",
+                peer_addr, request.version, TUNNEL_PROTOCOL_VERSION
+            );
+        } else if let Some(auth) = runtime.authorizer.get(&key_id) {
+            match tunnel_server.add_client(
+                key_id,
+                auth.x25519_public_bytes(),
+                enc_stream.tunnel_psk(),
+            ) {
+                Ok((lease, assigned)) => {
+                    info!(
+                        "client {} assigned tunnel addresses {} / {}",
+                        peer_addr, assigned.client_ipv4, assigned.client_ipv6
+                    );
+                    assignment = Some(assigned);
+                    tunnel_session = Some(TunnelSession {
+                        server: Arc::clone(tunnel_server),
+                        lease,
+                        installed: false,
+                        stats_task: None,
+                    });
+                }
+                Err(e) => {
+                    warn!(
+                        "could not add client {} to the tunnel, using relay: {:#}",
+                        peer_addr, e
+                    );
+                }
+            }
+        }
+    }
+
+    let (tcp_listeners, udp_sockets) = if tunnel_session.is_some() {
+        validate_proxy_specs(&mut enc_stream, &proxies).await?;
+        (Vec::new(), HashMap::new())
+    } else {
+        bind_requested_proxies(&mut enc_stream, &proxies, &runtime.config.proxy_bind_ip).await?
+    };
 
     let ack = TunnelFrame::Signal(ControlSignal::RegisterAck {
         success: true,
-        message: "registered".to_string(),
+        message: if assignment.is_some() {
+            "registered (tunnel data plane)".to_string()
+        } else {
+            "registered".to_string()
+        },
+        tunnel: assignment,
     });
     enc_stream.send_frame(&ack.encode()?).await?;
-    for status in &statuses {
-        status.mark_connected();
+    if tunnel_session.is_none() {
+        for status in &statuses {
+            status.mark_connected();
+        }
+        info!(
+            "client {} connected successfully ({} proxy rule(s) registered)",
+            peer_addr,
+            proxies.len()
+        );
     }
-    info!(
-        "client {} connected successfully ({} proxy rule(s) registered)",
-        peer_addr,
-        proxies.len()
-    );
 
     let (mut enc_read, mut enc_write) = enc_stream.into_split();
     // Control signals (work-connection requests, heartbeats) are few and must never be dropped;
@@ -437,7 +633,6 @@ async fn handle_control_session_inner(
         let ctrl_tx = ctrl_tx.clone();
         let pending_work_conns = Arc::clone(&runtime.pending_work_conns);
         let next_conn_id = Arc::clone(&runtime.next_conn_id);
-        let ebpf = runtime.ebpf.clone();
         let Some(connection) = proxy_statuses
             .get(&proxy_name)
             .cloned()
@@ -482,7 +677,6 @@ async fn handle_control_session_inner(
                         }
 
                         let pending_clone = Arc::clone(&pending_work_conns);
-                        let ebpf_clone = ebpf.clone();
                         let connection_status = connection.clone();
                         let pname = proxy_name.clone();
                         tokio::spawn(async move {
@@ -491,7 +685,6 @@ async fn handle_control_session_inner(
                                     let _ = relay_encrypted_and_plain_with_status(
                                         work_enc_stream,
                                         visitor_stream,
-                                        Some(&ebpf_clone),
                                         Some(&connection_status),
                                     )
                                     .await;
@@ -573,6 +766,7 @@ async fn handle_control_session_inner(
 
     // Control reader loop
     let heartbeat_timeout = Duration::from_secs(runtime.config.heartbeat_timeout_secs.max(10));
+    let mut session_error: Option<anyhow::Error> = None;
     loop {
         match timeout(heartbeat_timeout, enc_read.recv_frame()).await {
             Ok(Ok(Some(raw_frame))) => {
@@ -590,6 +784,65 @@ async fn handle_control_session_inner(
                         }
                         let _ =
                             ctrl_tx.send(TunnelFrame::Signal(ControlSignal::Pong { timestamp_ms }));
+                    }
+                    TunnelFrame::Signal(ControlSignal::TunnelReady { bindings }) => {
+                        let Some(session) = tunnel_session.as_mut() else {
+                            warn!(
+                                "client {} sent TunnelReady without a tunnel assignment",
+                                peer_addr
+                            );
+                            break;
+                        };
+                        if session.installed {
+                            debug!("ignoring duplicate TunnelReady from {}", peer_addr);
+                            continue;
+                        }
+                        let outcome =
+                            resolve_tunnel_bindings(&proxies, &bindings).and_then(|resolved| {
+                                session
+                                    .server
+                                    .install_bindings(&session.lease, &resolved)
+                                    .map(|()| resolved.len())
+                            });
+                        match outcome {
+                            Ok(count) => {
+                                session.installed = true;
+                                for status in &statuses {
+                                    status.mark_connected();
+                                }
+                                info!(
+                                    "client {} connected through the tunnel ({} proxy rule(s), {} port redirection(s))",
+                                    peer_addr,
+                                    proxies.len(),
+                                    count
+                                );
+                                let _ =
+                                    ctrl_tx.send(TunnelFrame::Signal(ControlSignal::TunnelAck {
+                                        success: true,
+                                        message: "tunnel redirections installed".to_string(),
+                                    }));
+                                session.stats_task = Some(spawn_tunnel_stats_task(
+                                    Arc::clone(&session.server),
+                                    session.lease,
+                                    proxy_statuses.clone(),
+                                ));
+                            }
+                            Err(e) => {
+                                let msg = format!("{:#}", e);
+                                warn!("rejecting tunnel registration from {}: {}", peer_addr, msg);
+                                let _ =
+                                    ctrl_tx.send(TunnelFrame::Signal(ControlSignal::TunnelAck {
+                                        success: false,
+                                        message: msg.clone(),
+                                    }));
+                                // Give the writer a moment to flush the verdict, then end the
+                                // session; the client reconnects in relay mode.
+                                sleep(Duration::from_millis(200)).await;
+                                session_error =
+                                    Some(anyhow!("tunnel registration rejected: {}", msg));
+                                break;
+                            }
+                        }
                     }
                     TunnelFrame::Signal(_) => {}
                     TunnelFrame::UdpDatagram {
@@ -637,8 +890,32 @@ async fn handle_control_session_inner(
     }
     writer_handle.abort();
     drop(udp_tx);
+    drop(tunnel_session);
 
-    Ok(())
+    match session_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+/// Copy kernel byte counters into the status entries so `rrp status` shows tunnel traffic.
+fn spawn_tunnel_stats_task(
+    server: Arc<TunnelServer>,
+    lease: TunnelLease,
+    proxy_statuses: HashMap<String, ConnectionStatus>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(TUNNEL_STATS_INTERVAL);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            for (proxy, traffic) in server.traffic(&lease) {
+                if let Some(status) = proxy_statuses.get(&proxy) {
+                    status.set_counters(traffic.client_to_visitor, traffic.visitor_to_client);
+                }
+            }
+        }
+    })
 }
 
 pub async fn run_server(config: ServerConfig) -> Result<()> {

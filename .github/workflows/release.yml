@@ -41,6 +41,14 @@ jobs:
       - name: Rust cargo cache
         uses: Swatinem/rust-cache@v2
 
+      - name: Install clang with BPF backend (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y clang llvm
+
+      - name: Compile the TC eBPF program
+        if: runner.os == 'Linux'
+        run: ./bpf/build.sh
+
       - name: Check formatting
         run: cargo fmt --all --check
 
