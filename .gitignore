@@ -1,0 +1,27 @@
+# Rust / Cargo build artifacts
+/target/
+**/*.rs.bk
+*.pdb
+
+# Local runtime configurations (may contain private keys)
+rrpc.toml
+rrps.toml
+*.local.toml
+
+# Local release / packaging artifacts
+/dist/
+*.tar.gz
+*.zip
+*.sha256
+
+# Logs
+*.log
+
+# OS & Editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
