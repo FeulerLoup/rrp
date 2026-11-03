@@ -378,7 +378,7 @@ static __always_inline __u32 addr_field_off(const struct parsed *p, int dst)
 				: __builtin_offsetof(struct ipv6hdr, saddr));
 }
 
-SEC("tc")
+SEC("classifier")
 int rrp_public_ingress(struct __sk_buff *skb)
 {
 	struct parsed p;
@@ -418,7 +418,7 @@ int rrp_public_ingress(struct __sk_buff *skb)
 	return bpf_redirect(cfg->tunnel_ifindex, 0);
 }
 
-SEC("tc")
+SEC("classifier")
 int rrp_tunnel_ingress(struct __sk_buff *skb)
 {
 	/* The WireGuard interface has no link-layer header: data starts at the IP header. */

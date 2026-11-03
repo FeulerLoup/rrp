@@ -40,5 +40,5 @@ CC="$(find_clang)" || {
 
 echo "built ${OUT} with ${CC}"
 if command -v llvm-objdump >/dev/null 2>&1; then
-    llvm-objdump -h "$OUT" | grep -E 'tc|maps|BTF' || true
+    llvm-objdump -h "$OUT" | grep -E 'classifier|maps|BTF' || true
 fi

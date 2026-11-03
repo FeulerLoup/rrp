@@ -30,8 +30,13 @@ use super::bpf_types::{ip_bytes, Config, PortKey, PortVal, RevKey, RevVal, Stats
 use super::ipam::{Cidr4, Cidr6, TunnelPool};
 use super::{PortTraffic, ResolvedBinding, TunnelLease};
 
-/// Compiled TC programs (see `bpf/rrp_tc.c`, rebuilt with `bpf/build.sh`).
-const RRP_TC_OBJECT: &[u8] = include_bytes!("../../bpf/rrp_tc.o");
+/// Compiled TC programs (see `bpf/rrp_tc.c`, rebuilt with `bpf/build.sh`). The ELF parser
+/// needs the bytes 8-byte aligned, which a plain `include_bytes!` does not guarantee.
+macro_rules! rrp_tc_object {
+    () => {
+        aya::include_bytes_aligned!("../../bpf/rrp_tc.o")
+    };
+}
 const RT_TABLE_MAIN: u32 = 254;
 
 struct ClientState {
@@ -156,7 +161,7 @@ impl TunnelServer {
             .context("failed to bring up the WireGuard interface")?;
 
         // 3. eBPF programs.
-        let mut ebpf = Ebpf::load(RRP_TC_OBJECT).context("failed to load rrp TC programs")?;
+        let mut ebpf = Ebpf::load(rrp_tc_object!()).context("failed to load rrp TC programs")?;
         ensure_clsact(&public_name)?;
         ensure_clsact(&config.interface)?;
         attach_tc(&mut ebpf, "rrp_public_ingress", &public_name)?;

@@ -165,6 +165,16 @@ tc filter show dev eth0 ingress   # 应看到 rrp_public_ingress
 ss -lntp | grep <remote_port>     # 应为空：端口没有用户态监听
 ```
 
+单机端到端验证脚本（需要 root，使用三个网络命名空间模拟访客/服务端/客户端，覆盖 IPv4/IPv6 的
+TCP/UDP 转发、MSS 钳制、严格 rp_filter、eBPF 计数回填、中继模式共存以及两端退出后的资源清理）：
+
+```bash
+sudo ./scripts/linux-tunnel-smoke.sh ./dist/rrp
+```
+
+该脚本已在 Ubuntu 26.04（内核 7.0，aarch64，Lima 虚拟机）上通过；macOS 开发机可用 `brew install lima` 后
+`limactl start template://ubuntu-lts` 得到同样的环境。
+
 ## 5. 查看运行状态
 
 ```bash

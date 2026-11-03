@@ -15,9 +15,12 @@ use rrp::status::{load_statuses, render_human, render_json};
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // netlink-packet-route warns (harmlessly) whenever a newer kernel appends fields to link
+    // attributes it knows; keep that off the default log level.
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new("info,netlink_packet_route=error")),
         )
         .init();
 

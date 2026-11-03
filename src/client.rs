@@ -8,7 +8,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use bytes::Bytes;
 use dashmap::DashMap;
 use tokio::sync::mpsc::error::TrySendError;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinSet;
 use tokio::time::{interval, timeout, MissedTickBehavior};
 use tracing::{debug, error, info, warn};
@@ -45,6 +45,8 @@ const UDP_OUTBOUND_QUEUE_LEN: usize = 1024;
 const UDP_MAX_SESSIONS: usize = 4096;
 /// Policy-routing table and rule priority base for client tunnel interfaces (one per server).
 const TUNNEL_ROUTE_TABLE_BASE: u32 = 7200;
+/// How long sessions get to tear down their tunnels after a shutdown signal.
+const SHUTDOWN_GRACE_PERIOD: Duration = Duration::from_secs(5);
 
 #[derive(Clone)]
 struct ServerEndpoint {
@@ -57,6 +59,11 @@ struct ServerEndpoint {
     tunnel_mode: TunnelMode,
     /// Set once a tunnel attempt failed in `auto` mode; later sessions use the relay.
     tunnel_failed: Arc<AtomicBool>,
+    /// Process-wide status, so a session can report which data plane it ended up on.
+    runtime_status: RuntimeStatus,
+    /// Flips to `true` when the process is shutting down; sessions then tear down cleanly
+    /// (tunnel interfaces, policy rules) instead of being cancelled mid-flight.
+    shutdown: watch::Receiver<bool>,
 }
 
 impl ServerEndpoint {
@@ -136,6 +143,7 @@ pub struct Client {
     ebpf: EbpfAccelerator,
     endpoints: Vec<ServerEndpoint>,
     status: RuntimeStatus,
+    shutdown_tx: watch::Sender<bool>,
 }
 
 impl Client {
@@ -154,6 +162,7 @@ impl Client {
             status.set_ebpf_status(ebpf.status_reason());
         }
 
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let multi_server = resolved_servers.len() > 1;
         let mut endpoints = Vec::with_capacity(resolved_servers.len());
         for (index, srv) in resolved_servers.into_iter().enumerate() {
@@ -200,6 +209,8 @@ impl Client {
                 statuses,
                 tunnel_mode,
                 tunnel_failed: Arc::new(AtomicBool::new(false)),
+                runtime_status: status.clone(),
+                shutdown: shutdown_rx.clone(),
             });
         }
 
@@ -217,7 +228,17 @@ impl Client {
             ebpf,
             endpoints,
             status,
+            shutdown_tx,
         })
+    }
+
+    /// Ask every session to end and clean up; `run`/`run_with_ready` return once they have.
+    pub fn request_shutdown(&self) {
+        let _ = self.shutdown_tx.send(true);
+    }
+
+    pub fn shutdown_handle(&self) -> watch::Sender<bool> {
+        self.shutdown_tx.clone()
     }
 
     pub fn ebpf(&self) -> &EbpfAccelerator {
@@ -353,7 +374,11 @@ impl Client {
 
             join_set.spawn(async move {
                 let mut reconnect_delay = RECONNECT_DELAY_INITIAL;
+                let mut shutdown = endpoint.shutdown.clone();
                 loop {
+                    if *shutdown.borrow() {
+                        break;
+                    }
                     let (attempt_tx, attempt_rx) = oneshot::channel();
                     let session_fut = run_endpoint_session(&endpoint, &ebpf, Some(attempt_tx));
 
@@ -386,6 +411,9 @@ impl Client {
                     if registered {
                         reconnect_delay = RECONNECT_DELAY_INITIAL;
                     }
+                    if *shutdown.borrow() {
+                        break;
+                    }
 
                     match res {
                         Ok(()) => {
@@ -404,7 +432,10 @@ impl Client {
                             );
                         }
                     }
-                    tokio::time::sleep(reconnect_delay).await;
+                    tokio::select! {
+                        _ = tokio::time::sleep(reconnect_delay) => {}
+                        _ = shutdown.changed() => break,
+                    }
                     reconnect_delay = (reconnect_delay * 2).min(RECONNECT_DELAY_MAX);
                 }
             });
@@ -564,6 +595,13 @@ async fn run_endpoint_session_inner(
                         "server {} does not offer the tunnel data plane; relaying instead",
                         display_name
                     );
+                    ebpf.set_fallback(format!(
+                        "server {} does not offer the tunnel data plane",
+                        display_name
+                    ));
+                    endpoint
+                        .runtime_status
+                        .set_ebpf_status(ebpf.status_reason());
                 }
                 endpoint.mark_connected();
                 info!(
@@ -673,6 +711,9 @@ async fn run_endpoint_session_inner(
                     endpoint.tunnel_interface(),
                     display_name
                 ));
+                endpoint
+                    .runtime_status
+                    .set_ebpf_status(ebpf.status_reason());
                 info!(
                     "connected to server {} through the tunnel ({} proxies registered: {})",
                     display_name,
@@ -755,9 +796,18 @@ async fn run_endpoint_session_inner(
     let mut udp_generation: u64 = 0;
     let read_timeout = Duration::from_secs(hb_secs.saturating_mul(3).max(15));
 
+    let mut shutdown = endpoint.shutdown.clone();
     let read_res: Result<()> = async {
         loop {
-            let raw_frame = match timeout(read_timeout, enc_read.recv_frame()).await {
+            let received = tokio::select! {
+                biased;
+                _ = shutdown.changed() => {
+                    info!("closing control session to server {} for shutdown", display_name);
+                    break;
+                }
+                res = timeout(read_timeout, enc_read.recv_frame()) => res,
+            };
+            let raw_frame = match received {
                 Ok(Ok(Some(frame))) => frame,
                 Ok(Ok(None)) => break,
                 Ok(Err(e)) => return Err(e.into()),
@@ -918,6 +968,9 @@ fn tunnel_failure(
     match endpoint.tunnel_mode {
         TunnelMode::Auto => {
             endpoint.tunnel_failed.store(true, Ordering::Relaxed);
+            endpoint
+                .runtime_status
+                .set_ebpf_status(format!("fallback (tunnel failed: {:#})", e));
             warn!(
                 "tunnel data plane failed for server {}; falling back to relay on reconnect: {:#}",
                 display_name, e
@@ -1049,10 +1102,22 @@ pub async fn run_client(config: ClientConfig) -> Result<()> {
             None
         }
     };
+    // On SIGTERM/SIGINT ask the sessions to end so tunnel interfaces and policy rules are
+    // removed; give them a bounded grace period before exiting regardless.
+    let shutdown_tx = client.shutdown_handle();
+    let mut shutdown_rx = shutdown_tx.subscribe();
+    tokio::spawn(async move {
+        wait_for_shutdown_signal().await;
+        info!("rrp client shutting down");
+        let _ = shutdown_tx.send(true);
+    });
     let res = tokio::select! {
         res = client.run() => res,
-        _ = wait_for_shutdown_signal() => {
-            info!("rrp client shutting down");
+        _ = async {
+            let _ = shutdown_rx.changed().await;
+            tokio::time::sleep(SHUTDOWN_GRACE_PERIOD).await;
+        } => {
+            warn!("sessions did not finish within {:?}; exiting anyway", SHUTDOWN_GRACE_PERIOD);
             Ok(())
         }
     };

@@ -9,6 +9,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
 use futures::TryStreamExt;
+use netlink_packet_route::route::RouteScope;
 use netlink_packet_route::rule::{RuleAction, RuleAttribute, RuleMessage};
 use rtnetlink::{Handle, IpVersion};
 use tracing::{debug, info, warn};
@@ -189,6 +190,7 @@ impl TunnelClient {
             .v4()
             .destination_prefix(Ipv4Addr::UNSPECIFIED, 0)
             .output_interface(self.ifindex)
+            .scope(RouteScope::Link)
             .table_id(table_id)
             .replace()
             .execute()
@@ -200,6 +202,7 @@ impl TunnelClient {
             .v6()
             .destination_prefix(Ipv6Addr::UNSPECIFIED, 0)
             .output_interface(self.ifindex)
+            .scope(RouteScope::Link)
             .table_id(table_id)
             .replace()
             .execute()
