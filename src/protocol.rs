@@ -5,9 +5,24 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
 
 use crate::config::ProxyType;
+use crate::crypto::MAX_FRAME_PAYLOAD_LEN;
 
 const TAG_JSON_CONTROL: u8 = 0x01;
 const TAG_UDP_PACKET: u8 = 0x02;
+
+/// Control-channel messages are decoded one encrypted frame at a time, so a message must never be
+/// split across frames. Reject anything that would be, instead of corrupting the channel.
+fn ensure_single_frame(len: usize, what: &str) -> Result<()> {
+    if len > MAX_FRAME_PAYLOAD_LEN {
+        bail!(
+            "{} of {} bytes exceeds the {} byte frame limit",
+            what,
+            len,
+            MAX_FRAME_PAYLOAD_LEN
+        );
+    }
+    Ok(())
+}
 
 const ADDR_V4: u8 = 4;
 const ADDR_V6: u8 = 6;
@@ -25,13 +40,8 @@ pub struct ProxySpec {
 /// First message sent by client after completing the mlkem768x25519plus handshake.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum RoleHandshake {
-    Control {
-        proxies: Vec<ProxySpec>,
-    },
-    WorkTcp {
-        conn_id: u64,
-        proxy_name: String,
-    },
+    Control { proxies: Vec<ProxySpec> },
+    WorkTcp { conn_id: u64, proxy_name: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -65,7 +75,9 @@ pub enum TunnelFrame {
 
 impl RoleHandshake {
     pub fn encode(&self) -> Result<Vec<u8>> {
-        serde_json::to_vec(self).context("failed to encode RoleHandshake")
+        let json = serde_json::to_vec(self).context("failed to encode RoleHandshake")?;
+        ensure_single_frame(json.len(), "RoleHandshake")?;
+        Ok(json)
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self> {
@@ -78,6 +90,7 @@ impl TunnelFrame {
         match self {
             TunnelFrame::Signal(sig) => {
                 let json = serde_json::to_vec(sig).context("failed to serialize ControlSignal")?;
+                ensure_single_frame(1 + json.len(), "control signal")?;
                 let mut buf = BytesMut::with_capacity(1 + json.len());
                 buf.put_u8(TAG_JSON_CONTROL);
                 buf.put_slice(&json);
@@ -96,8 +109,9 @@ impl TunnelFrame {
                     SocketAddr::V4(_) => 1 + 4 + 2,
                     SocketAddr::V6(_) => 1 + 16 + 2,
                 };
-                let mut buf =
-                    BytesMut::with_capacity(1 + 2 + name_bytes.len() + addr_len + payload.len());
+                let total_len = 1 + 2 + name_bytes.len() + addr_len + payload.len();
+                ensure_single_frame(total_len, "UDP datagram frame")?;
+                let mut buf = BytesMut::with_capacity(total_len);
                 buf.put_u8(TAG_UDP_PACKET);
                 buf.put_u16(name_bytes.len() as u16);
                 buf.put_slice(name_bytes);

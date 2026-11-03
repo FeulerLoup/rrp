@@ -1,5 +1,6 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+#[cfg(target_os = "linux")]
 use tracing::{debug, info};
 
 /// Built-in eBPF `SOCKHASH` / `SK_MSG` socket redirection accelerator for Linux.
@@ -100,7 +101,11 @@ impl EbpfAccelerator {
 
     /// Register a pair of socket file descriptors in the eBPF `SOCKHASH` map for kernel-level redirection.
     #[cfg(unix)]
-    pub fn register_socket_pair(&self, fd_a: std::os::unix::io::RawFd, fd_b: std::os::unix::io::RawFd) -> bool {
+    pub fn register_socket_pair(
+        &self,
+        fd_a: std::os::unix::io::RawFd,
+        fd_b: std::os::unix::io::RawFd,
+    ) -> bool {
         #[cfg(target_os = "linux")]
         {
             if let Some(map_fd) = self.inner.sockhash_fd {

@@ -9,17 +9,18 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::oneshot;
 
-use rrp::cli::{
-    Cli, Commands, RunMode, DEFAULT_CLIENT_CONFIG_PATH, DEFAULT_SERVER_CONFIG_PATH,
-};
+use rrp::cli::{Cli, Commands, RunMode, DEFAULT_CLIENT_CONFIG_PATH, DEFAULT_SERVER_CONFIG_PATH};
 use rrp::client::Client;
 use rrp::config::{
-    approve_client_key, install_client_key, ClientConfig, ClientServerConfig, ProxyConfig,
-    ProxyType, ServerConfig,
+    approve_client_key, install_client_key, install_client_key_with, ClientConfig,
+    ClientServerConfig, ProxyConfig, ProxyType, ServerConfig,
 };
-use rrp::crypto::{generate_keypair, AuthorizedPublicKey, ClientKeyPair};
+use rrp::crypto::{
+    client_handshake, generate_keypair, AuthorizedPublicKey, ClientKeyPair, MAX_FRAME_PAYLOAD_LEN,
+};
 use rrp::ebpf::EbpfAccelerator;
-use rrp::net_utils::{bind_tcp_listener, bind_udp_socket};
+use rrp::net_utils::{bind_tcp_listener, bind_udp_socket, connect_tcp};
+use rrp::protocol::{ControlSignal, ProxySpec, RoleHandshake, TunnelFrame};
 use rrp::relay::relay_plain_tcp_pair;
 use rrp::server::Server;
 use rrp::service::{
@@ -223,7 +224,8 @@ async fn test_status_subcommand_human_and_json_output() {
         .expect("run human status command");
     assert!(human.status.success());
     let human_stdout = String::from_utf8_lossy(&human.stdout);
-    assert!(human_stdout.contains("    - example_tcp [connected]\n      tcp 127.0.0.1:18080 -> 127.0.0.1:8080\n"));
+    assert!(human_stdout
+        .contains("    - example_tcp [connected]\n      tcp 127.0.0.1:18080 -> 127.0.0.1:8080\n"));
     assert!(human_stdout.contains("Connected for:"));
     assert!(human_stdout.contains("Traffic:"));
     assert!(human_stdout.contains("Last heartbeat:"));
@@ -232,12 +234,7 @@ async fn test_status_subcommand_human_and_json_output() {
     assert!(!human_stdout.contains("Proxies:"));
 
     let json = Command::new(bin)
-        .args([
-            "status",
-            "--file",
-            status_path.to_str().unwrap(),
-            "--json",
-        ])
+        .args(["status", "--file", status_path.to_str().unwrap(), "--json"])
         .output()
         .expect("run JSON status command");
     assert!(json.status.success());
@@ -465,13 +462,22 @@ async fn test_tcp_udp_and_all_forwarding() {
     let mut visitor_all_tcp = TcpStream::connect(format!("127.0.0.1:{}", remote_all_port))
         .await
         .unwrap();
-    visitor_all_tcp.write_all(b"all-mode-tcp-data").await.unwrap();
+    visitor_all_tcp
+        .write_all(b"all-mode-tcp-data")
+        .await
+        .unwrap();
     let mut all_tcp_reply = [0u8; 17];
-    visitor_all_tcp.read_exact(&mut all_tcp_reply).await.unwrap();
+    visitor_all_tcp
+        .read_exact(&mut all_tcp_reply)
+        .await
+        .unwrap();
     assert_eq!(&all_tcp_reply, b"all-mode-tcp-data");
 
     visitor_udp
-        .send_to(b"all-mode-udp-data", format!("127.0.0.1:{}", remote_all_port))
+        .send_to(
+            b"all-mode-udp-data",
+            format!("127.0.0.1:{}", remote_all_port),
+        )
         .await
         .unwrap();
     let (n, _) = tokio::time::timeout(Duration::from_secs(5), visitor_udp.recv_from(&mut udp_buf))
@@ -586,14 +592,20 @@ async fn test_ipv4_ipv6_cross_translation() {
     let mut v4_tcp = TcpStream::connect(format!("127.0.0.1:{}", remote_v4_entry_port))
         .await
         .unwrap();
-    v4_tcp.write_all(b"ipv4-visitor-to-ipv6-local").await.unwrap();
+    v4_tcp
+        .write_all(b"ipv4-visitor-to-ipv6-local")
+        .await
+        .unwrap();
     let mut buf = [0u8; 26];
     v4_tcp.read_exact(&mut buf).await.unwrap();
     assert_eq!(&buf, b"ipv4-visitor-to-ipv6-local");
 
     let v4_udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     v4_udp
-        .send_to(b"v4-to-v6-udp", format!("127.0.0.1:{}", remote_v4_entry_port))
+        .send_to(
+            b"v4-to-v6-udp",
+            format!("127.0.0.1:{}", remote_v4_entry_port),
+        )
         .await
         .unwrap();
     let mut ubuf = [0u8; 256];
@@ -607,7 +619,10 @@ async fn test_ipv4_ipv6_cross_translation() {
     let mut v6_tcp = TcpStream::connect(format!("[::1]:{}", remote_v6_entry_port))
         .await
         .unwrap();
-    v6_tcp.write_all(b"ipv6-visitor-to-ipv4-local").await.unwrap();
+    v6_tcp
+        .write_all(b"ipv6-visitor-to-ipv4-local")
+        .await
+        .unwrap();
     let mut buf2 = [0u8; 26];
     v6_tcp.read_exact(&mut buf2).await.unwrap();
     assert_eq!(&buf2, b"ipv6-visitor-to-ipv4-local");
@@ -1103,4 +1118,298 @@ async fn test_multi_server_fault_isolation_and_auto_reconnect() {
     client_handle.abort();
     server_a_handle.abort();
     server_b_handle.abort();
+}
+
+#[test]
+fn test_install_preserves_existing_key_and_restricts_permissions() {
+    let dir = tempdir().unwrap();
+    let cfg_path = dir.path().join("rrpc.toml");
+
+    let first = install_client_key_with(&cfg_path, false).unwrap();
+    assert!(first.generated);
+
+    // Re-running install (e.g. to add --autostart later) must not rotate the key.
+    let second = install_client_key_with(&cfg_path, false).unwrap();
+    assert!(!second.generated);
+    assert_eq!(second.private_key, first.private_key);
+    assert_eq!(second.public_key, first.public_key);
+    let (kept_priv, kept_pub) = install_client_key(&cfg_path).unwrap();
+    assert_eq!(kept_priv, first.private_key);
+    assert_eq!(kept_pub, first.public_key);
+
+    // Explicit rotation produces a different keypair and persists it.
+    let rotated = install_client_key_with(&cfg_path, true).unwrap();
+    assert!(rotated.generated);
+    assert_ne!(rotated.private_key, first.private_key);
+    assert_eq!(
+        ClientConfig::load(&cfg_path).unwrap().private_key,
+        rotated.private_key
+    );
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(&cfg_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "client config holding a private key must be 0600"
+        );
+    }
+}
+
+#[test]
+fn test_malformed_configs_are_never_overwritten() {
+    let dir = tempdir().unwrap();
+
+    let client_cfg = dir.path().join("rrpc.toml");
+    fs::write(&client_cfg, "this is = not [valid toml").unwrap();
+    let before = fs::read_to_string(&client_cfg).unwrap();
+    assert!(install_client_key(&client_cfg).is_err());
+    assert_eq!(fs::read_to_string(&client_cfg).unwrap(), before);
+
+    let server_cfg = dir.path().join("rrps.toml");
+    fs::write(&server_cfg, "authorized_keys = [ \"unterminated").unwrap();
+    let before = fs::read_to_string(&server_cfg).unwrap();
+    let (_priv, pub_b64) = generate_keypair();
+    assert!(approve_client_key(&server_cfg, &pub_b64).is_err());
+    assert_eq!(fs::read_to_string(&server_cfg).unwrap(), before);
+
+    // A valid server config with an existing key keeps that key when another is approved.
+    let (_p1, pub1) = generate_keypair();
+    let (_p2, pub2) = generate_keypair();
+    assert!(approve_client_key(&client_cfg.with_extension("srv.toml"), &pub1).unwrap());
+    assert!(approve_client_key(&client_cfg.with_extension("srv.toml"), &pub2).unwrap());
+    let loaded = ServerConfig::load(&client_cfg.with_extension("srv.toml")).unwrap();
+    assert_eq!(loaded.authorized_keys, vec![pub1, pub2]);
+}
+
+#[test]
+fn test_config_validation_rejects_conflicts_and_bad_addresses() {
+    let (priv_b64, _pub) = generate_keypair();
+    let base = ClientConfig {
+        server_addr: "10.0.0.1:3700".to_string(),
+        private_key: priv_b64,
+        proxies: vec![],
+        ..Default::default()
+    };
+
+    let proxy = |name: &str, ty: ProxyType, port: u16| ProxyConfig {
+        name: name.to_string(),
+        proxy_type: ty,
+        local_addr: Some("127.0.0.1:8080".to_string()),
+        remote_port: port,
+        ..Default::default()
+    };
+
+    // Two TCP proxies on one remote port cannot both bind on the server.
+    let mut tcp_clash = base.clone();
+    tcp_clash.proxies = vec![
+        proxy("a", ProxyType::Tcp, 18080),
+        proxy("b", ProxyType::All, 18080),
+    ];
+    let err = tcp_clash.validate().unwrap_err().to_string();
+    assert!(err.contains("both bind TCP remote_port 18080"), "{err}");
+
+    // TCP and UDP on the same port is fine.
+    let mut mixed = base.clone();
+    mixed.proxies = vec![
+        proxy("a", ProxyType::Tcp, 18080),
+        proxy("b", ProxyType::Udp, 18080),
+    ];
+    mixed.validate().unwrap();
+
+    // Different bind IPs on the same port are fine too.
+    let mut split_ip = base.clone();
+    let mut v4 = proxy("a", ProxyType::Tcp, 18080);
+    v4.remote_bind_ip = Some("127.0.0.1".to_string());
+    let mut v6 = proxy("b", ProxyType::Tcp, 18080);
+    v6.remote_bind_ip = Some("::1".to_string());
+    split_ip.proxies = vec![v4, v6];
+    split_ip.validate().unwrap();
+
+    // Malformed addresses are caught at load time rather than at the first registration.
+    let mut bad_bind_ip = base.clone();
+    let mut p = proxy("a", ProxyType::Tcp, 18080);
+    p.remote_bind_ip = Some("not-an-ip".to_string());
+    bad_bind_ip.proxies = vec![p];
+    assert!(bad_bind_ip.validate().is_err());
+
+    let mut bad_local = base.clone();
+    let mut p = proxy("a", ProxyType::Tcp, 18080);
+    p.local_addr = Some("127.0.0.1".to_string());
+    bad_local.proxies = vec![p];
+    assert!(bad_local.validate().is_err());
+
+    let bad_server = ServerConfig {
+        bind_addr: "3700".to_string(),
+        ..Default::default()
+    };
+    assert!(bad_server.validate().is_err());
+    let bad_proxy_ip = ServerConfig {
+        proxy_bind_ip: "[::".to_string(),
+        ..Default::default()
+    };
+    assert!(bad_proxy_ip.validate().is_err());
+    ServerConfig::default().validate().unwrap();
+}
+
+#[test]
+fn test_control_messages_never_span_multiple_frames() {
+    let v6_visitor: SocketAddr = "[2001:db8::1]:40000".parse().unwrap();
+    // The server's receive buffer can yield up to 65535 bytes; with the tag, name and IPv6
+    // visitor address header that exceeds MAX_FRAME_PAYLOAD_LEN. Splitting it would
+    // desynchronize the control channel, so encoding must refuse instead.
+    let too_big = TunnelFrame::UdpDatagram {
+        proxy_name: "udp".to_string(),
+        visitor_addr: v6_visitor,
+        payload: vec![0u8; 65_535].into(),
+    };
+    assert!(too_big.encode().is_err());
+
+    let fits = TunnelFrame::UdpDatagram {
+        proxy_name: "udp".to_string(),
+        visitor_addr: v6_visitor,
+        payload: vec![0u8; MAX_FRAME_PAYLOAD_LEN - 64].into(),
+    };
+    let encoded = fits.encode().unwrap();
+    assert!(encoded.len() <= MAX_FRAME_PAYLOAD_LEN);
+    match TunnelFrame::decode(encoded).unwrap() {
+        TunnelFrame::UdpDatagram {
+            visitor_addr,
+            payload,
+            ..
+        } => {
+            assert_eq!(visitor_addr, v6_visitor);
+            assert_eq!(payload.len(), MAX_FRAME_PAYLOAD_LEN - 64);
+        }
+        other => panic!("unexpected frame {other:?}"),
+    }
+
+    let huge_registration = RoleHandshake::Control {
+        proxies: (0..2_000)
+            .map(|i| ProxySpec {
+                name: format!("proxy_{i}"),
+                proxy_type: ProxyType::Tcp,
+                local_addr: "127.0.0.1:8080".to_string(),
+                remote_port: 10_000 + i as u16,
+                remote_bind_ip: None,
+            })
+            .collect(),
+    };
+    assert!(huge_registration.encode().is_err());
+}
+
+#[tokio::test]
+async fn test_work_connection_cannot_be_claimed_by_another_client() {
+    let (priv_a, pub_a) = generate_keypair();
+    let (priv_b, pub_b) = generate_keypair();
+    let key_a = ClientKeyPair::from_base64(&priv_a).unwrap();
+    let key_b = ClientKeyPair::from_base64(&priv_b).unwrap();
+
+    let server = Server::new(ServerConfig {
+        bind_addr: "127.0.0.1:0".to_string(),
+        proxy_bind_ip: "127.0.0.1".to_string(),
+        authorized_keys: vec![pub_a, pub_b],
+        enable_ebpf: false,
+        heartbeat_timeout_secs: 60,
+    })
+    .unwrap();
+    let server_addr = server.local_addr().to_string();
+    let server_handle = tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+
+    // Client A opens a bare control session that registers a TCP proxy but handles work-connection
+    // requests manually, so the test controls exactly who answers them.
+    let remote_port = get_free_port("127.0.0.1");
+    let ctrl = connect_tcp(&server_addr).await.unwrap();
+    let mut ctrl = client_handshake(ctrl, &key_a).await.unwrap();
+    let role = RoleHandshake::Control {
+        proxies: vec![ProxySpec {
+            name: "guarded".to_string(),
+            proxy_type: ProxyType::Tcp,
+            local_addr: "127.0.0.1:1".to_string(),
+            remote_port,
+            remote_bind_ip: None,
+        }],
+    };
+    ctrl.send_frame(&role.encode().unwrap()).await.unwrap();
+    match TunnelFrame::decode(ctrl.recv_frame().await.unwrap().unwrap()).unwrap() {
+        TunnelFrame::Signal(ControlSignal::RegisterAck { success, message }) => {
+            assert!(success, "{message}");
+        }
+        other => panic!("unexpected frame {other:?}"),
+    }
+
+    // A visitor arrives; the server asks client A for a work connection with some conn_id.
+    let mut visitor = TcpStream::connect(format!("127.0.0.1:{remote_port}"))
+        .await
+        .unwrap();
+    let conn_id = loop {
+        let raw = tokio::time::timeout(Duration::from_secs(5), ctrl.recv_frame())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        if let TunnelFrame::Signal(ControlSignal::ReqWorkConn {
+            conn_id,
+            proxy_name,
+            ..
+        }) = TunnelFrame::decode(raw).unwrap()
+        {
+            assert_eq!(proxy_name, "guarded");
+            break conn_id;
+        }
+    };
+
+    // Client B (authorized, but a different identity) tries to claim that conn_id.
+    let rogue = connect_tcp(&server_addr).await.unwrap();
+    let mut rogue = client_handshake(rogue, &key_b).await.unwrap();
+    let steal = RoleHandshake::WorkTcp {
+        conn_id,
+        proxy_name: "guarded".to_string(),
+    };
+    rogue.send_frame(&steal.encode().unwrap()).await.unwrap();
+    // The server must refuse and close the connection rather than relay the visitor to B.
+    let rogue_result = tokio::time::timeout(Duration::from_secs(5), rogue.recv_frame())
+        .await
+        .expect("server should close the rogue work connection promptly");
+    assert!(
+        matches!(rogue_result, Ok(None) | Err(_)),
+        "rogue client received visitor traffic: {rogue_result:?}"
+    );
+
+    // Client A, using the wrong proxy name, is refused as well.
+    let wrong_proxy = connect_tcp(&server_addr).await.unwrap();
+    let mut wrong_proxy = client_handshake(wrong_proxy, &key_a).await.unwrap();
+    let role = RoleHandshake::WorkTcp {
+        conn_id,
+        proxy_name: "other".to_string(),
+    };
+    wrong_proxy
+        .send_frame(&role.encode().unwrap())
+        .await
+        .unwrap();
+    let wrong_result = tokio::time::timeout(Duration::from_secs(5), wrong_proxy.recv_frame())
+        .await
+        .unwrap();
+    assert!(matches!(wrong_result, Ok(None) | Err(_)));
+
+    // The legitimate owner can still claim it and receives the visitor's bytes.
+    let work = connect_tcp(&server_addr).await.unwrap();
+    let mut work = client_handshake(work, &key_a).await.unwrap();
+    let role = RoleHandshake::WorkTcp {
+        conn_id,
+        proxy_name: "guarded".to_string(),
+    };
+    work.send_frame(&role.encode().unwrap()).await.unwrap();
+    visitor.write_all(b"only-for-client-a").await.unwrap();
+    let got = tokio::time::timeout(Duration::from_secs(5), work.recv_frame())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(&got[..], b"only-for-client-a");
+
+    server_handle.abort();
 }

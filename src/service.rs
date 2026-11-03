@@ -143,8 +143,9 @@ pub fn install_autostart_service(
             let dir = custom_dir
                 .map(Path::to_path_buf)
                 .unwrap_or_else(|| PathBuf::from("/Library/LaunchDaemons"));
-            fs::create_dir_all(&dir)
-                .with_context(|| format!("failed to create LaunchDaemons directory {}", dir.display()))?;
+            fs::create_dir_all(&dir).with_context(|| {
+                format!("failed to create LaunchDaemons directory {}", dir.display())
+            })?;
 
             let plist_name = format!("com.rrp.{}.plist", mode_str);
             let plist_path = dir.join(&plist_name);

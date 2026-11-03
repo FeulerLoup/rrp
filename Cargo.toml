@@ -36,5 +36,7 @@ opt-level = 3
 lto = "thin"
 codegen-units = 1
 strip = true
-panic = "abort"
+# Keep unwinding: tokio isolates a panicking connection task as a JoinError instead of the whole
+# proxy process aborting and dropping every live tunnel.
+panic = "unwind"
 

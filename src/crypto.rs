@@ -18,7 +18,10 @@ use rand::rngs::OsRng;
 use rand::RngCore;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
-use x25519_dalek::{EphemeralSecret, PublicKey as X25519PublicKey, StaticSecret as X25519StaticSecret};
+use tracing::warn;
+use x25519_dalek::{
+    EphemeralSecret, PublicKey as X25519PublicKey, StaticSecret as X25519StaticSecret,
+};
 
 pub const MLKEM768_DK_LEN: usize = 2400;
 pub const MLKEM768_EK_LEN: usize = 1184;
@@ -32,7 +35,10 @@ pub const KEY_ID_LEN: usize = 32;
 const PROTOCOL_VERSION: u8 = 0x01;
 const HANDSHAKE_TIME_WINDOW_SECS: u64 = 300;
 const AEAD_TAG_LEN: usize = 16;
-const MAX_FRAME_PAYLOAD_LEN: usize = 64 * 1024;
+/// Maximum plaintext length carried by a single encrypted frame. Larger payloads passed to
+/// `send_frame` are split into multiple frames (valid for byte streams); control messages and UDP
+/// datagrams must fit in one frame, which `protocol` enforces at encode time.
+pub const MAX_FRAME_PAYLOAD_LEN: usize = 64 * 1024;
 
 pub type KeyId = [u8; KEY_ID_LEN];
 
@@ -80,7 +86,7 @@ fn hex_short(bytes: &[u8]) -> String {
 pub fn generate_keypair() -> (String, String) {
     let mut rng = OsRng;
     let (dk, ek) = MlKem768::generate(&mut rng);
-    let x25519_sk = X25519StaticSecret::random_from_rng(&mut rng);
+    let x25519_sk = X25519StaticSecret::random_from_rng(rng);
     let x25519_pk = X25519PublicKey::from(&x25519_sk);
 
     let mut priv_bytes = Vec::with_capacity(PRIVATE_KEY_LEN);
@@ -92,8 +98,8 @@ pub fn generate_keypair() -> (String, String) {
     pub_bytes.extend_from_slice(x25519_pk.as_bytes());
 
     (
-        URL_SAFE_NO_PAD.encode(&priv_bytes),
-        URL_SAFE_NO_PAD.encode(&pub_bytes),
+        URL_SAFE_NO_PAD.encode(priv_bytes),
+        URL_SAFE_NO_PAD.encode(pub_bytes),
     )
 }
 
@@ -142,7 +148,7 @@ impl ClientKeyPair {
         let mut pub_bytes = Vec::with_capacity(PUBLIC_KEY_LEN);
         pub_bytes.extend_from_slice(self.ek.as_bytes().as_slice());
         pub_bytes.extend_from_slice(self.x25519_pk.as_bytes());
-        URL_SAFE_NO_PAD.encode(&pub_bytes)
+        URL_SAFE_NO_PAD.encode(pub_bytes)
     }
 
     pub fn key_id(&self) -> &KeyId {
@@ -284,12 +290,15 @@ fn make_nonce(seq: u64) -> Nonce {
 }
 
 /// Perform client-side mlkem768x25519plus post-quantum handshake over `stream`.
-pub async fn client_handshake<S>(mut stream: S, keypair: &ClientKeyPair) -> Result<EncryptedStream<S>>
+pub async fn client_handshake<S>(
+    mut stream: S,
+    keypair: &ClientKeyPair,
+) -> Result<EncryptedStream<S>>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let mut rng = OsRng;
-    let client_eph_sk = EphemeralSecret::random_from_rng(&mut rng);
+    let client_eph_sk = EphemeralSecret::random_from_rng(rng);
     let client_eph_pk = X25519PublicKey::from(&client_eph_sk);
 
     let mut client_nonce = [0u8; 32];
@@ -382,7 +391,8 @@ where
         .map_err(|_| anyhow!("failed to encrypt ClientFinish verify token"))?;
 
     let finish_pad = random_padding();
-    let mut finish_msg = BytesMut::with_capacity(2 + finish_pad.len() + encrypted_client_verify.len());
+    let mut finish_msg =
+        BytesMut::with_capacity(2 + finish_pad.len() + encrypted_client_verify.len());
     finish_msg.put_u16(finish_pad.len() as u16);
     finish_msg.put_slice(&finish_pad);
     finish_msg.put_slice(&encrypted_client_verify);
@@ -439,13 +449,28 @@ where
         .context("failed to read ClientHello padding")?;
 
     let now = current_unix_secs();
-    if now.abs_diff(timestamp) > HANDSHAKE_TIME_WINDOW_SECS {
-        bail!("ClientHello timestamp out of acceptable window");
+    let skew = now.abs_diff(timestamp);
+    if skew > HANDSHAKE_TIME_WINDOW_SECS {
+        warn!(
+            "rejected ClientHello for key_id {}: clock skew of {}s exceeds the {}s window (check NTP on both hosts)",
+            key_id_hex(&key_id),
+            skew,
+            HANDSHAKE_TIME_WINDOW_SECS
+        );
+        bail!(
+            "ClientHello timestamp out of acceptable window (skew {}s > {}s)",
+            skew,
+            HANDSHAKE_TIME_WINDOW_SECS
+        );
     }
 
-    let auth_key = authorizer
-        .get(&key_id)
-        .ok_or_else(|| anyhow!("unauthorized client key_id (public key not approved)"))?;
+    let Some(auth_key) = authorizer.get(&key_id) else {
+        warn!(
+            "rejected handshake: client key_id {} is not in authorized_keys",
+            key_id_hex(&key_id)
+        );
+        bail!("unauthorized client key_id (public key not approved)");
+    };
 
     let mut rng = OsRng;
     let (kem_ct, ss_kem): (Ciphertext<MlKem768>, SharedKey<MlKem768>) = auth_key
@@ -514,9 +539,19 @@ where
     let client_verify_ct = &cf_tail[cf_pad_len..];
     let decrypted_client_verify = c2s_cipher
         .decrypt(&make_nonce(0), client_verify_ct)
-        .map_err(|_| anyhow!("ClientFinish authentication tag verification failed"))?;
+        .map_err(|_| {
+            warn!(
+                "rejected handshake for key_id {}: ClientFinish authentication failed (wrong private key?)",
+                key_id_hex(&key_id)
+            );
+            anyhow!("ClientFinish authentication tag verification failed")
+        })?;
 
     if decrypted_client_verify.as_slice() != expected_client_verify.as_slice() {
+        warn!(
+            "rejected handshake for key_id {}: ClientFinish verification token mismatch",
+            key_id_hex(&key_id)
+        );
         bail!("ClientFinish verification token mismatch");
     }
 
@@ -544,9 +579,11 @@ impl<S> EncryptedStream<S> {
             // Nonce 0 is used during handshake verification; data frames start at sequence 1.
             tx_seq: 1,
             rx_seq: 1,
-            read_wire_buf: BytesMut::with_capacity(MAX_FRAME_PAYLOAD_LEN + 32),
-            read_plain_buf: BytesMut::with_capacity(MAX_FRAME_PAYLOAD_LEN),
-            write_wire_buf: BytesMut::with_capacity(MAX_FRAME_PAYLOAD_LEN + 32),
+            // Buffers grow on demand: eagerly reserving ~192 KiB per connection would make every
+            // pending handshake and idle work connection far more expensive than necessary.
+            read_wire_buf: BytesMut::new(),
+            read_plain_buf: BytesMut::new(),
+            write_wire_buf: BytesMut::new(),
         }
     }
 
@@ -558,7 +595,12 @@ impl<S> EncryptedStream<S> {
         &self.inner
     }
 
-    pub fn into_split(self) -> (EncryptedReadHalf<tokio::io::ReadHalf<S>>, EncryptedWriteHalf<tokio::io::WriteHalf<S>>)
+    pub fn into_split(
+        self,
+    ) -> (
+        EncryptedReadHalf<tokio::io::ReadHalf<S>>,
+        EncryptedWriteHalf<tokio::io::WriteHalf<S>>,
+    )
     where
         S: AsyncRead + AsyncWrite,
     {
@@ -643,10 +685,7 @@ impl<R: AsyncRead + Unpin> EncryptedReadHalf<R> {
         }
 
         let seq = self.rx_seq;
-        self.rx_seq = self
-            .rx_seq
-            .checked_add(1)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "rx nonce overflow"))?;
+        self.rx_seq = next_seq(self.rx_seq, "rx")?;
 
         let nonce = make_nonce(seq);
         let (ct, tag_bytes) = buf.split_at_mut(plain_len);
@@ -654,11 +693,20 @@ impl<R: AsyncRead + Unpin> EncryptedReadHalf<R> {
 
         self.rx_cipher
             .decrypt_in_place_detached(&nonce, &len_buf, ct, tag)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "AEAD authentication failed"))?;
+            .map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "AEAD authentication failed")
+            })?;
 
         buf.truncate(plain_len);
         Ok(Some(buf.freeze()))
     }
+}
+
+/// Advance a frame sequence counter, refusing to wrap: a wrapped counter would reuse an AEAD
+/// nonce under the same key, which is catastrophic for ChaCha20-Poly1305.
+fn next_seq(seq: u64, direction: &'static str) -> io::Result<u64> {
+    seq.checked_add(1)
+        .ok_or_else(|| io::Error::other(format!("{} nonce counter exhausted", direction)))
 }
 
 impl<W: AsyncWrite + Unpin> EncryptedWriteHalf<W> {
@@ -672,10 +720,7 @@ impl<W: AsyncWrite + Unpin> EncryptedWriteHalf<W> {
             payload = &payload[chunk_len..];
 
             let seq = self.tx_seq;
-            self.tx_seq = self
-                .tx_seq
-                .checked_add(1)
-                .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "tx nonce overflow"))?;
+            self.tx_seq = next_seq(self.tx_seq, "tx")?;
 
             let nonce = make_nonce(seq);
             self.write_wire_buf.clear();
@@ -714,10 +759,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> EncryptedStream<S> {
             payload = &payload[chunk_len..];
 
             let seq = self.tx_seq;
-            self.tx_seq = self
-                .tx_seq
-                .checked_add(1)
-                .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "tx nonce overflow"))?;
+            self.tx_seq = next_seq(self.tx_seq, "tx")?;
 
             let nonce = make_nonce(seq);
             self.write_wire_buf.clear();
@@ -760,10 +802,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> EncryptedStream<S> {
         self.inner.read_exact(&mut buf).await?;
 
         let seq = self.rx_seq;
-        self.rx_seq = self
-            .rx_seq
-            .checked_add(1)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "rx nonce overflow"))?;
+        self.rx_seq = next_seq(self.rx_seq, "rx")?;
 
         let nonce = make_nonce(seq);
         let (ct, tag_bytes) = buf.split_at_mut(plain_len);
@@ -771,7 +810,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> EncryptedStream<S> {
 
         self.rx_cipher
             .decrypt_in_place_detached(&nonce, &len_buf, ct, tag)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "AEAD authentication failed"))?;
+            .map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "AEAD authentication failed")
+            })?;
 
         buf.truncate(plain_len);
         Ok(Some(buf.freeze()))
@@ -816,7 +857,10 @@ impl<S: AsyncRead + Unpin> AsyncRead for EncryptedStream<S> {
                     frame.advance(4);
 
                     let seq = this.rx_seq;
-                    this.rx_seq += 1;
+                    this.rx_seq = match next_seq(this.rx_seq, "rx") {
+                        Ok(next) => next,
+                        Err(e) => return Poll::Ready(Err(e)),
+                    };
                     let nonce = make_nonce(seq);
 
                     let (ct, tag_slice) = frame.split_at_mut(plain_len);
@@ -896,7 +940,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for EncryptedStream<S> {
         let chunk = &buf[..chunk_len];
 
         let seq = this.tx_seq;
-        this.tx_seq += 1;
+        this.tx_seq = next_seq(this.tx_seq, "tx")?;
         let nonce = make_nonce(seq);
 
         this.write_wire_buf.reserve(4 + chunk_len + AEAD_TAG_LEN);
@@ -907,7 +951,11 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for EncryptedStream<S> {
 
         let tag = this
             .tx_cipher
-            .encrypt_in_place_detached(&nonce, &len_bytes, &mut this.write_wire_buf[start..start + chunk_len])
+            .encrypt_in_place_detached(
+                &nonce,
+                &len_bytes,
+                &mut this.write_wire_buf[start..start + chunk_len],
+            )
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "AEAD encryption failed"))?;
         this.write_wire_buf.extend_from_slice(tag.as_slice());
 
@@ -976,7 +1024,10 @@ mod tests {
 
         let client_task = tokio::spawn(async move {
             let mut stream = client_handshake(client_io, &client_kp).await.unwrap();
-            stream.send_frame(b"hello post-quantum world").await.unwrap();
+            stream
+                .send_frame(b"hello post-quantum world")
+                .await
+                .unwrap();
             let reply = stream.recv_frame().await.unwrap().unwrap();
             assert_eq!(&reply[..], b"ack from server");
 
@@ -1009,8 +1060,10 @@ mod tests {
 
         let (client_io, server_io) = tokio::io::duplex(16 * 1024);
 
-        let server_res = tokio::spawn(async move { server_handshake(server_io, &authorizer).await });
-        let _client_res = tokio::spawn(async move { client_handshake(client_io, &client_kp).await });
+        let server_res =
+            tokio::spawn(async move { server_handshake(server_io, &authorizer).await });
+        let _client_res =
+            tokio::spawn(async move { client_handshake(client_io, &client_kp).await });
 
         assert!(server_res.await.unwrap().is_err());
     }

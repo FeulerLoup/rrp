@@ -5,14 +5,18 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use rand::RngCore;
-use socket2::{Domain, Protocol, Socket, Type};
+use socket2::{Domain, Protocol, Socket, TcpKeepalive, Type};
 use tokio::net::{lookup_host, TcpListener, TcpStream, UdpSocket};
 use tokio::time::timeout;
+use tracing::warn;
 
 const SOCKET_BUF_SIZE: usize = 512 * 1024;
 const DNS_RESOLVE_TIMEOUT: Duration = Duration::from_secs(5);
 const DNS_UDP_QUERY_TIMEOUT: Duration = Duration::from_secs(2);
 const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+const TCP_KEEPALIVE_IDLE: Duration = Duration::from_secs(30);
+#[allow(dead_code)]
+const TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
 
 const DNS_TYPE_A: u16 = 1;
 const DNS_TYPE_CNAME: u16 = 5;
@@ -93,7 +97,8 @@ pub async fn resolve_socket_addrs(addr_str: &str) -> Result<Vec<SocketAddr>> {
     Ok(prioritize_routable_addrs(addrs))
 }
 
-fn split_host_port(addr_str: &str) -> Result<(&str, u16)> {
+/// Split `host:port` / `[ipv6]:port` into its parts, validating the port.
+pub fn split_host_port(addr_str: &str) -> Result<(&str, u16)> {
     if let Some(rest) = addr_str.strip_prefix('[') {
         let (host, port_part) = rest
             .split_once("]:")
@@ -185,7 +190,7 @@ async fn lookup_dns_strict(host: &str, port: u16) -> Vec<SocketAddr> {
         );
 
         let mut addrs = Vec::with_capacity(v4_ips.len() + v6_ips.len());
-        for ip in v4_ips.into_iter().chain(v6_ips.into_iter()) {
+        for ip in v4_ips.into_iter().chain(v6_ips) {
             let sa = SocketAddr::new(ip, port);
             if !addrs.contains(&sa) {
                 addrs.push(sa);
@@ -433,15 +438,26 @@ fn prioritize_routable_addrs(addrs: Vec<SocketAddr>) -> Vec<SocketAddr> {
     routable
 }
 
-/// Bind a high-performance TCP listener supporting IPv4, IPv6, and dual-stack (`[::]:port`).
-pub fn bind_tcp_listener(addr_str: &str) -> Result<TcpListener> {
-    let addr: SocketAddr = addr_str
-        .parse()
-        .with_context(|| format!("invalid TCP bind address '{}'", addr_str))?;
+/// When the host has IPv6 disabled entirely (common on minimal VPS images), binding the default
+/// dual-stack wildcard `[::]` fails. Fall back to the IPv4 wildcard so the default configuration
+/// still works there instead of refusing to start.
+fn ipv4_wildcard_fallback(addr: SocketAddr, error: &std::io::Error) -> Option<SocketAddr> {
+    let SocketAddr::V6(v6) = addr else {
+        return None;
+    };
+    if !v6.ip().is_unspecified() {
+        return None;
+    }
+    let ipv6_unavailable = matches!(
+        error.raw_os_error(),
+        Some(libc::EAFNOSUPPORT | libc::EADDRNOTAVAIL | libc::EPROTONOSUPPORT)
+    );
+    ipv6_unavailable.then(|| SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), v6.port()))
+}
 
+fn bind_tcp_listener_at(addr: SocketAddr) -> std::io::Result<TcpListener> {
     let domain = Domain::for_address(addr);
-    let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))
-        .context("failed to create TCP socket")?;
+    let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
 
     if let SocketAddr::V6(v6) = addr {
         if v6.ip().is_unspecified() {
@@ -450,21 +466,63 @@ pub fn bind_tcp_listener(addr_str: &str) -> Result<TcpListener> {
         }
     }
 
+    // SO_REUSEADDR lets a restarted server rebind while old connections sit in TIME_WAIT. It does
+    // not allow two live TCP listeners on the same port, so proxy port conflicts still surface.
     let _ = socket.set_reuse_address(true);
     let _ = socket.set_nodelay(true);
     let _ = socket.set_recv_buffer_size(SOCKET_BUF_SIZE);
     let _ = socket.set_send_buffer_size(SOCKET_BUF_SIZE);
     socket.set_nonblocking(true)?;
-
-    socket
-        .bind(&addr.into())
-        .with_context(|| format!("failed to bind TCP socket on {}", addr))?;
-    socket
-        .listen(1024)
-        .with_context(|| format!("failed to listen on TCP socket {}", addr))?;
+    socket.bind(&addr.into())?;
+    socket.listen(1024)?;
 
     let std_listener: std::net::TcpListener = socket.into();
-    TcpListener::from_std(std_listener).context("failed to convert std TcpListener to tokio")
+    TcpListener::from_std(std_listener)
+}
+
+/// Bind a high-performance TCP listener supporting IPv4, IPv6, and dual-stack (`[::]:port`).
+pub fn bind_tcp_listener(addr_str: &str) -> Result<TcpListener> {
+    let addr: SocketAddr = addr_str
+        .parse()
+        .with_context(|| format!("invalid TCP bind address '{}'", addr_str))?;
+
+    match bind_tcp_listener_at(addr) {
+        Ok(listener) => Ok(listener),
+        Err(error) => {
+            if let Some(v4_addr) = ipv4_wildcard_fallback(addr, &error) {
+                warn!(
+                    "IPv6 appears unavailable ({}); binding TCP listener on {} instead of {}",
+                    error, v4_addr, addr
+                );
+                return bind_tcp_listener_at(v4_addr)
+                    .with_context(|| format!("failed to bind TCP socket on {}", v4_addr));
+            }
+            Err(error).with_context(|| format!("failed to bind TCP socket on {}", addr))
+        }
+    }
+}
+
+fn bind_udp_socket_at(addr: SocketAddr) -> std::io::Result<UdpSocket> {
+    let domain = Domain::for_address(addr);
+    let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
+
+    if let SocketAddr::V6(v6) = addr {
+        if v6.ip().is_unspecified() {
+            // Enable dual-stack IPv4 + IPv6 when binding to [::]:port
+            let _ = socket.set_only_v6(false);
+        }
+    }
+
+    // Deliberately no SO_REUSEADDR: on Linux and BSD/macOS it lets several UDP sockets bind the
+    // same port, so two clients registering the same UDP remote_port would both "succeed" and
+    // visitor traffic would silently reach only one of them. Binding must be exclusive.
+    let _ = socket.set_recv_buffer_size(SOCKET_BUF_SIZE);
+    let _ = socket.set_send_buffer_size(SOCKET_BUF_SIZE);
+    socket.set_nonblocking(true)?;
+    socket.bind(&addr.into())?;
+
+    let std_udp: std::net::UdpSocket = socket.into();
+    UdpSocket::from_std(std_udp)
 }
 
 /// Bind a high-performance UDP socket supporting IPv4, IPv6, and dual-stack (`[::]:port`).
@@ -473,28 +531,20 @@ pub fn bind_udp_socket(addr_str: &str) -> Result<UdpSocket> {
         .parse()
         .with_context(|| format!("invalid UDP bind address '{}'", addr_str))?;
 
-    let domain = Domain::for_address(addr);
-    let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))
-        .context("failed to create UDP socket")?;
-
-    if let SocketAddr::V6(v6) = addr {
-        if v6.ip().is_unspecified() {
-            // Enable dual-stack IPv4 + IPv6 when binding to [::]:port
-            let _ = socket.set_only_v6(false);
+    match bind_udp_socket_at(addr) {
+        Ok(socket) => Ok(socket),
+        Err(error) => {
+            if let Some(v4_addr) = ipv4_wildcard_fallback(addr, &error) {
+                warn!(
+                    "IPv6 appears unavailable ({}); binding UDP socket on {} instead of {}",
+                    error, v4_addr, addr
+                );
+                return bind_udp_socket_at(v4_addr)
+                    .with_context(|| format!("failed to bind UDP socket on {}", v4_addr));
+            }
+            Err(error).with_context(|| format!("failed to bind UDP socket on {}", addr))
         }
     }
-
-    let _ = socket.set_reuse_address(true);
-    let _ = socket.set_recv_buffer_size(SOCKET_BUF_SIZE);
-    let _ = socket.set_send_buffer_size(SOCKET_BUF_SIZE);
-    socket.set_nonblocking(true)?;
-
-    socket
-        .bind(&addr.into())
-        .with_context(|| format!("failed to bind UDP socket on {}", addr))?;
-
-    let std_udp: std::net::UdpSocket = socket.into();
-    UdpSocket::from_std(std_udp).context("failed to convert std UdpSocket to tokio")
 }
 
 /// Bind an ephemeral local UDP socket matching the address family (IPv4 or IPv6) of `target`.
@@ -518,7 +568,10 @@ pub async fn connect_tcp(target_str: &str) -> Result<TcpStream> {
             Ok(res) => res,
             Err(_) => Err(std::io::Error::new(
                 ErrorKind::TimedOut,
-                format!("connection to {} timed out after {:?}", addr, TCP_CONNECT_TIMEOUT),
+                format!(
+                    "connection to {} timed out after {:?}",
+                    addr, TCP_CONNECT_TIMEOUT
+                ),
             )),
         };
 
@@ -528,13 +581,11 @@ pub async fn connect_tcp(target_str: &str) -> Result<TcpStream> {
                 return Ok(stream);
             }
             Err(e) => {
-                let is_unroutable_family = matches!(
-                    e.kind(),
-                    ErrorKind::AddrNotAvailable
-                ) || matches!(
-                    e.raw_os_error(),
-                    Some(libc::ENETUNREACH | libc::EHOSTUNREACH | libc::EAFNOSUPPORT)
-                );
+                let is_unroutable_family = matches!(e.kind(), ErrorKind::AddrNotAvailable)
+                    || matches!(
+                        e.raw_os_error(),
+                        Some(libc::ENETUNREACH | libc::EHOSTUNREACH | libc::EAFNOSUPPORT)
+                    );
                 if is_unroutable_family {
                     fallback_err = Some(e);
                 } else {
@@ -554,13 +605,46 @@ pub async fn connect_tcp(target_str: &str) -> Result<TcpStream> {
     ))
 }
 
+/// Connect to an already-resolved socket address with the standard connect timeout and tuning.
+pub async fn connect_tcp_addr(addr: SocketAddr) -> Result<TcpStream> {
+    let stream = timeout(TCP_CONNECT_TIMEOUT, TcpStream::connect(addr))
+        .await
+        .with_context(|| {
+            format!(
+                "connection to {} timed out after {:?}",
+                addr, TCP_CONNECT_TIMEOUT
+            )
+        })?
+        .with_context(|| format!("failed to connect to {}", addr))?;
+    configure_tcp_stream(&stream);
+    Ok(stream)
+}
+
 /// Configure low-latency & high-throughput parameters on an active `TcpStream`.
+///
+/// Keepalive probes start after 30s of idle time instead of the kernel default (two hours on
+/// Linux), so tunnel and work connections whose peer vanished behind a NAT or a crashed host are
+/// torn down in about a minute rather than lingering indefinitely.
 pub fn configure_tcp_stream(stream: &TcpStream) {
     let _ = stream.set_nodelay(true);
     let sock_ref = socket2::SockRef::from(stream);
     let _ = sock_ref.set_recv_buffer_size(SOCKET_BUF_SIZE);
     let _ = sock_ref.set_send_buffer_size(SOCKET_BUF_SIZE);
-    let _ = sock_ref.set_keepalive(true);
+    let keepalive = TcpKeepalive::new().with_time(TCP_KEEPALIVE_IDLE);
+    #[cfg(any(
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "fuchsia",
+        target_os = "illumos",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "netbsd",
+        target_os = "tvos",
+        target_os = "watchos",
+    ))]
+    let keepalive = keepalive.with_interval(TCP_KEEPALIVE_INTERVAL);
+    let _ = sock_ref.set_tcp_keepalive(&keepalive);
 }
 
 #[cfg(test)]

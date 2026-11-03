@@ -22,12 +22,17 @@ curl -fsSL https://ghfast.top/https://raw.githubusercontent.com/FeulerLoup/rrp/m
 ## 1. 客户端生成密钥与设置开机自启
 
 ```bash
-# 生成 mlkem768x25519 密钥对，默认写入 /usr/local/etc/rrp/rrpc.toml，终端输出公钥
+# 生成 mlkem768x25519 密钥对，默认写入 /usr/local/etc/rrp/rrpc.toml（文件权限 0600），终端输出公钥
 sudo rrp install --mode client
 
 # 同时设置系统级开机自启（Linux systemd / macOS launchd），也可通过 -c 指定自定义路径
 sudo rrp install --mode client -c /usr/local/etc/rrp/rrpc.toml --autostart
+
+# 重复执行 install 会保留已有私钥并再次打印公钥；如需轮换密钥（需在服务端重新 approve）：
+sudo rrp install --mode client --regenerate-key
 ```
+
+`rrp install` / `rrp approve` 遇到已存在但无法解析的配置文件时会直接报错退出，不会用默认配置覆盖。
 
 ## 2. 服务端授权公钥与设置开机自启
 

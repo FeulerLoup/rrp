@@ -8,27 +8,41 @@ use anyhow::{anyhow, bail, Context, Result};
 use bytes::Bytes;
 use dashmap::DashMap;
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, oneshot, watch};
-use tokio::time::timeout;
+use tokio::time::{sleep, timeout};
 use tracing::{debug, info, warn};
 
 use crate::cli::RunMode;
 use crate::config::ServerConfig;
-use crate::crypto::{server_handshake, EncryptedStream, ServerAuthorizer};
+use crate::crypto::{key_id_hex, server_handshake, EncryptedStream, KeyId, ServerAuthorizer};
 use crate::ebpf::EbpfAccelerator;
-use crate::net_utils::{bind_tcp_listener, bind_udp_socket, format_bind_addr, normalize_socket_addr};
+use crate::net_utils::{
+    bind_tcp_listener, bind_udp_socket, format_bind_addr, normalize_socket_addr,
+};
 use crate::protocol::{ControlSignal, ProxySpec, RoleHandshake, TunnelFrame};
 use crate::relay::relay_encrypted_and_plain_with_status;
-use crate::status::{
-    wait_for_shutdown_signal, ConnectionStatus, RuntimeStatus, StatusReporter,
-};
+use crate::status::{wait_for_shutdown_signal, ConnectionStatus, RuntimeStatus, StatusReporter};
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const WORK_CONN_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 const UDP_MAX_PACKET_SIZE: usize = 65535;
+/// Datagrams queued towards one client's control channel. Anything beyond this is dropped at the
+/// server instead of being buffered without bound while the client link is slow or stalled.
+const UDP_OUTBOUND_QUEUE_LEN: usize = 1024;
+/// Pause after a transient `accept`/`recv_from` failure (e.g. EMFILE) so a persistent error does
+/// not turn into a hot loop that starves the rest of the runtime.
+const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
 
-type PendingWorkConnections =
-    Arc<DashMap<u64, oneshot::Sender<EncryptedStream<TcpStream>>>>;
+/// A visitor waiting for the client to open a matching work connection. The entry is bound to the
+/// client identity and proxy that requested it, so another authorized client cannot claim it.
+struct PendingWorkConn {
+    key_id: KeyId,
+    proxy_name: String,
+    tx: oneshot::Sender<EncryptedStream<TcpStream>>,
+}
+
+type PendingWorkConnections = Arc<DashMap<u64, PendingWorkConn>>;
 
 #[derive(Clone)]
 struct ServerRuntime {
@@ -55,6 +69,11 @@ impl Server {
     pub fn new(config: ServerConfig) -> Result<Self> {
         config.validate()?;
         let authorizer = ServerAuthorizer::new(&config.authorized_keys)?;
+        if authorizer.is_empty() {
+            warn!(
+                "no authorized_keys configured: every client handshake will be rejected until `rrp approve <PUBLIC_KEY>` is run"
+            );
+        }
         let ebpf = EbpfAccelerator::try_init(config.enable_ebpf);
         let listener = bind_tcp_listener(&config.bind_addr)?;
         let local_addr = listener
@@ -107,13 +126,21 @@ impl Server {
         };
 
         loop {
-            let (stream, peer_addr) = self.listener.accept().await?;
+            let (stream, peer_addr) = match self.listener.accept().await {
+                Ok(accepted) => accepted,
+                Err(e) => {
+                    // EMFILE/ENFILE/ECONNABORTED etc. are transient: a production server must
+                    // keep serving existing tunnels rather than exit on the first failed accept.
+                    warn!("failed to accept incoming connection: {}; retrying", e);
+                    sleep(ACCEPT_ERROR_BACKOFF).await;
+                    continue;
+                }
+            };
             let peer_addr = normalize_socket_addr(peer_addr);
             let runtime = runtime.clone();
 
             tokio::spawn(async move {
-                if let Err(e) = handle_incoming_connection(stream, peer_addr, runtime).await
-                {
+                if let Err(e) = handle_incoming_connection(stream, peer_addr, runtime).await {
                     debug!("connection from {} ended: {:#}", peer_addr, e);
                 }
             });
@@ -126,7 +153,7 @@ async fn handle_incoming_connection(
     peer_addr: SocketAddr,
     runtime: ServerRuntime,
 ) -> Result<()> {
-    let (mut enc_stream, _key_id) = timeout(
+    let (mut enc_stream, key_id) = timeout(
         HANDSHAKE_TIMEOUT,
         server_handshake(stream, &runtime.authorizer),
     )
@@ -145,27 +172,45 @@ async fn handle_incoming_connection(
             conn_id,
             proxy_name,
         } => {
-            if let Some((_, tx)) = runtime.pending_work_conns.remove(&conn_id) {
-                let _ = tx.send(enc_stream);
-                debug!(
-                    "paired work connection conn_id={} for proxy '{}' from {}",
-                    conn_id, proxy_name, peer_addr
-                );
-            } else {
-                warn!(
-                    "received unknown or expired work connection conn_id={} for proxy '{}'",
-                    conn_id, proxy_name
-                );
+            let claimed = runtime
+                .pending_work_conns
+                .remove_if(&conn_id, |_, pending| {
+                    pending.key_id == key_id && pending.proxy_name == proxy_name
+                });
+            match claimed {
+                Some((_, pending)) => {
+                    let _ = pending.tx.send(enc_stream);
+                    debug!(
+                        "paired work connection conn_id={} for proxy '{}' from {}",
+                        conn_id, proxy_name, peer_addr
+                    );
+                }
+                None if runtime.pending_work_conns.contains_key(&conn_id) => {
+                    warn!(
+                        "client {} (key {}) tried to claim work connection conn_id={} for proxy '{}' that belongs to a different client or proxy; refused",
+                        peer_addr,
+                        key_id_hex(&key_id),
+                        conn_id,
+                        proxy_name
+                    );
+                }
+                None => {
+                    debug!(
+                        "received unknown or expired work connection conn_id={} for proxy '{}' from {}",
+                        conn_id, proxy_name, peer_addr
+                    );
+                }
             }
             Ok(())
         }
         RoleHandshake::Control { proxies } => {
             info!(
-                "authenticated client control connection from {} with {} proxy rule(s)",
+                "authenticated client control connection from {} (key {}) with {} proxy rule(s)",
                 peer_addr,
+                key_id_hex(&key_id),
                 proxies.len()
             );
-            handle_control_session(enc_stream, peer_addr, proxies, runtime).await
+            handle_control_session(enc_stream, peer_addr, key_id, proxies, runtime).await
         }
     }
 }
@@ -173,6 +218,7 @@ async fn handle_incoming_connection(
 async fn handle_control_session(
     enc_stream: EncryptedStream<TcpStream>,
     peer_addr: SocketAddr,
+    key_id: KeyId,
     proxies: Vec<ProxySpec>,
     runtime: ServerRuntime,
 ) -> Result<()> {
@@ -211,6 +257,7 @@ async fn handle_control_session(
     let result = handle_control_session_inner(
         enc_stream,
         peer_addr,
+        key_id,
         proxies,
         runtime.clone(),
         proxy_statuses,
@@ -236,22 +283,30 @@ async fn handle_control_session(
     result
 }
 
-async fn handle_control_session_inner(
-    mut enc_stream: EncryptedStream<TcpStream>,
-    peer_addr: SocketAddr,
-    proxies: Vec<ProxySpec>,
-    runtime: ServerRuntime,
-    proxy_statuses: HashMap<String, ConnectionStatus>,
-    statuses: Vec<ConnectionStatus>,
-) -> Result<()> {
+/// Bind every listener/socket a client asked for, or report the first failure to the client as a
+/// failed `RegisterAck` and abort the session. Already-bound sockets are released on failure.
+async fn bind_requested_proxies(
+    enc_stream: &mut EncryptedStream<TcpStream>,
+    proxies: &[ProxySpec],
+    default_bind_ip: &str,
+) -> Result<(Vec<(String, TcpListener)>, HashMap<String, Arc<UdpSocket>>)> {
     let mut tcp_listeners: Vec<(String, TcpListener)> = Vec::new();
     let mut udp_sockets: HashMap<String, Arc<UdpSocket>> = HashMap::new();
+    let mut seen_names: std::collections::HashSet<&str> = std::collections::HashSet::new();
 
-    for proxy in &proxies {
-        let bind_ip = proxy
-            .remote_bind_ip
-            .as_deref()
-            .unwrap_or(&runtime.config.proxy_bind_ip);
+    for proxy in proxies {
+        if !seen_names.insert(proxy.name.as_str()) {
+            let msg = format!("duplicate proxy name '{}' in registration", proxy.name);
+            reject_registration(enc_stream, &msg).await;
+            bail!("{}", msg);
+        }
+        if proxy.remote_port == 0 {
+            let msg = format!("proxy '{}' requested remote_port 0", proxy.name);
+            reject_registration(enc_stream, &msg).await;
+            bail!("{}", msg);
+        }
+
+        let bind_ip = proxy.remote_bind_ip.as_deref().unwrap_or(default_bind_ip);
         let bind_addr = format_bind_addr(bind_ip, proxy.remote_port);
 
         if proxy.proxy_type.has_tcp() {
@@ -266,14 +321,10 @@ async fn handle_control_session_inner(
                 }
                 Err(e) => {
                     let msg = format!(
-                        "failed to bind TCP listener for proxy '{}' on {}: {}",
+                        "failed to bind TCP listener for proxy '{}' on {}: {:#}",
                         proxy.name, bind_addr, e
                     );
-                    let ack = TunnelFrame::Signal(ControlSignal::RegisterAck {
-                        success: false,
-                        message: msg.clone(),
-                    });
-                    let _ = enc_stream.send_frame(&ack.encode()?).await;
+                    reject_registration(enc_stream, &msg).await;
                     bail!("{}", msg);
                 }
             }
@@ -291,19 +342,40 @@ async fn handle_control_session_inner(
                 }
                 Err(e) => {
                     let msg = format!(
-                        "failed to bind UDP socket for proxy '{}' on {}: {}",
+                        "failed to bind UDP socket for proxy '{}' on {}: {:#}",
                         proxy.name, bind_addr, e
                     );
-                    let ack = TunnelFrame::Signal(ControlSignal::RegisterAck {
-                        success: false,
-                        message: msg.clone(),
-                    });
-                    let _ = enc_stream.send_frame(&ack.encode()?).await;
+                    reject_registration(enc_stream, &msg).await;
                     bail!("{}", msg);
                 }
             }
         }
     }
+
+    Ok((tcp_listeners, udp_sockets))
+}
+
+async fn reject_registration(enc_stream: &mut EncryptedStream<TcpStream>, message: &str) {
+    let ack = TunnelFrame::Signal(ControlSignal::RegisterAck {
+        success: false,
+        message: message.to_string(),
+    });
+    if let Ok(bytes) = ack.encode() {
+        let _ = enc_stream.send_frame(&bytes).await;
+    }
+}
+
+async fn handle_control_session_inner(
+    mut enc_stream: EncryptedStream<TcpStream>,
+    peer_addr: SocketAddr,
+    key_id: KeyId,
+    proxies: Vec<ProxySpec>,
+    runtime: ServerRuntime,
+    proxy_statuses: HashMap<String, ConnectionStatus>,
+    statuses: Vec<ConnectionStatus>,
+) -> Result<()> {
+    let (tcp_listeners, udp_sockets) =
+        bind_requested_proxies(&mut enc_stream, &proxies, &runtime.config.proxy_bind_ip).await?;
 
     let ack = TunnelFrame::Signal(ControlSignal::RegisterAck {
         success: true,
@@ -320,29 +392,41 @@ async fn handle_control_session_inner(
     );
 
     let (mut enc_read, mut enc_write) = enc_stream.into_split();
+    // Control signals (work-connection requests, heartbeats) are few and must never be dropped;
+    // UDP datagrams are bulk traffic that may be dropped under back-pressure.
     let (ctrl_tx, mut ctrl_rx) = mpsc::unbounded_channel::<TunnelFrame>();
+    let (udp_tx, mut udp_rx) = mpsc::channel::<TunnelFrame>(UDP_OUTBOUND_QUEUE_LEN);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
-    // Spawn control channel writer
+    // Spawn control channel writer; signals take priority over queued datagrams.
     let mut writer_shutdown = shutdown_rx.clone();
     let writer_handle = tokio::spawn(async move {
+        // The UDP queue closes once every producer is gone (e.g. no UDP proxies registered);
+        // that must only disable the branch, not end the writer for control signals.
+        let mut udp_open = true;
         loop {
-            tokio::select! {
-                maybe_frame = ctrl_rx.recv() => {
-                    match maybe_frame {
-                        Some(frame) => {
-                            if let Ok(bytes) = frame.encode() {
-                                if enc_write.send_frame(&bytes).await.is_err() {
-                                    break;
-                                }
-                            }
-                        }
-                        None => break,
+            let frame = tokio::select! {
+                biased;
+                _ = writer_shutdown.changed() => break,
+                maybe_frame = ctrl_rx.recv() => match maybe_frame {
+                    Some(frame) => frame,
+                    None => break,
+                },
+                maybe_frame = udp_rx.recv(), if udp_open => match maybe_frame {
+                    Some(frame) => frame,
+                    None => {
+                        udp_open = false;
+                        continue;
+                    }
+                },
+            };
+            match frame.encode() {
+                Ok(bytes) => {
+                    if enc_write.send_frame(&bytes).await.is_err() {
+                        break;
                     }
                 }
-                _ = writer_shutdown.changed() => {
-                    break;
-                }
+                Err(e) => debug!("dropping unencodable tunnel frame: {:#}", e),
             }
         }
     });
@@ -370,14 +454,22 @@ async fn handle_control_session_inner(
                         let (visitor_stream, visitor_addr) = match accept_res {
                             Ok(v) => v,
                             Err(e) => {
-                                warn!("TCP accept error on proxy '{}': {}", proxy_name, e);
+                                warn!("TCP accept error on proxy '{}': {}; retrying", proxy_name, e);
+                                sleep(ACCEPT_ERROR_BACKOFF).await;
                                 continue;
                             }
                         };
                         let visitor_addr = normalize_socket_addr(visitor_addr);
                         let conn_id = next_conn_id.fetch_add(1, Ordering::Relaxed);
                         let (work_tx, work_rx) = oneshot::channel();
-                        pending_work_conns.insert(conn_id, work_tx);
+                        pending_work_conns.insert(
+                            conn_id,
+                            PendingWorkConn {
+                                key_id,
+                                proxy_name: proxy_name.clone(),
+                                tx: work_tx,
+                            },
+                        );
 
                         let req = TunnelFrame::Signal(ControlSignal::ReqWorkConn {
                             conn_id,
@@ -407,8 +499,8 @@ async fn handle_control_session_inner(
                                 _ => {
                                     pending_clone.remove(&conn_id);
                                     debug!(
-                                        "timed out waiting for work connection conn_id={} on proxy '{}'",
-                                        conn_id, pname
+                                        "timed out waiting for work connection conn_id={} on proxy '{}' (visitor {})",
+                                        conn_id, pname, visitor_addr
                                     );
                                 }
                             }
@@ -427,7 +519,7 @@ async fn handle_control_session_inner(
     for (proxy_name, udp_sock) in &udp_sockets {
         let proxy_name = proxy_name.clone();
         let udp_sock = Arc::clone(udp_sock);
-        let ctrl_tx = ctrl_tx.clone();
+        let udp_tx = udp_tx.clone();
         let Some(connection) = proxy_statuses
             .get(&proxy_name)
             .cloned()
@@ -439,6 +531,7 @@ async fn handle_control_session_inner(
 
         let handle = tokio::spawn(async move {
             let mut buf = vec![0u8; UDP_MAX_PACKET_SIZE];
+            let mut dropped: u64 = 0;
             loop {
                 tokio::select! {
                     recv_res = udp_sock.recv_from(&mut buf) => {
@@ -446,16 +539,26 @@ async fn handle_control_session_inner(
                             Ok((n, visitor_addr)) => {
                                 let frame = TunnelFrame::UdpDatagram {
                                     proxy_name: proxy_name.clone(),
-                                    visitor_addr,
+                                    visitor_addr: normalize_socket_addr(visitor_addr),
                                     payload: Bytes::copy_from_slice(&buf[..n]),
                                 };
-                                if ctrl_tx.send(frame).is_err() {
-                                    break;
+                                match udp_tx.try_send(frame) {
+                                    Ok(()) => connection.record_sent(n),
+                                    Err(TrySendError::Full(_)) => {
+                                        dropped += 1;
+                                        if dropped.is_power_of_two() {
+                                            warn!(
+                                                "proxy '{}' [UDP]: client link is saturated, dropped {} datagram(s) so far",
+                                                proxy_name, dropped
+                                            );
+                                        }
+                                    }
+                                    Err(TrySendError::Closed(_)) => break,
                                 }
-                                connection.record_sent(n);
                             }
                             Err(e) => {
-                                warn!("UDP recv_from error on proxy '{}': {}", proxy_name, e);
+                                debug!("UDP recv_from error on proxy '{}': {}", proxy_name, e);
+                                sleep(ACCEPT_ERROR_BACKOFF).await;
                             }
                         }
                     }
@@ -469,8 +572,7 @@ async fn handle_control_session_inner(
     }
 
     // Control reader loop
-    let heartbeat_timeout =
-        Duration::from_secs(runtime.config.heartbeat_timeout_secs.max(10));
+    let heartbeat_timeout = Duration::from_secs(runtime.config.heartbeat_timeout_secs.max(10));
     loop {
         match timeout(heartbeat_timeout, enc_read.recv_frame()).await {
             Ok(Ok(Some(raw_frame))) => {
@@ -486,9 +588,8 @@ async fn handle_control_session_inner(
                         for status in &statuses {
                             status.record_heartbeat(None);
                         }
-                        let _ = ctrl_tx.send(TunnelFrame::Signal(ControlSignal::Pong {
-                            timestamp_ms,
-                        }));
+                        let _ =
+                            ctrl_tx.send(TunnelFrame::Signal(ControlSignal::Pong { timestamp_ms }));
                     }
                     TunnelFrame::Signal(_) => {}
                     TunnelFrame::UdpDatagram {
@@ -496,9 +597,8 @@ async fn handle_control_session_inner(
                         visitor_addr,
                         payload,
                     } => {
-                        if let Some(connection) = proxy_statuses
-                            .get(&proxy_name)
-                            .or_else(|| statuses.first())
+                        if let Some(connection) =
+                            proxy_statuses.get(&proxy_name).or_else(|| statuses.first())
                         {
                             connection.record_received(payload.len());
                         }
@@ -522,7 +622,10 @@ async fn handle_control_session_inner(
                 break;
             }
             Err(_) => {
-                warn!("client {} heartbeat timed out", peer_addr);
+                warn!(
+                    "client {} heartbeat timed out (no frame for {:?})",
+                    peer_addr, heartbeat_timeout
+                );
                 break;
             }
         }
@@ -533,6 +636,7 @@ async fn handle_control_session_inner(
         task.abort();
     }
     writer_handle.abort();
+    drop(udp_tx);
 
     Ok(())
 }

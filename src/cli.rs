@@ -62,6 +62,10 @@ pub enum Commands {
         /// Optional custom directory for service file output (defaults to /etc/systemd/system or /Library/LaunchDaemons)
         #[arg(long)]
         service_dir: Option<PathBuf>,
+        /// Client mode only: discard the existing private key and generate a new keypair
+        /// (the new public key must be approved on the server again)
+        #[arg(long, default_value_t = false)]
+        regenerate_key: bool,
     },
     /// Uninstall system autostart service and optionally purge binary and configuration files
     Uninstall {

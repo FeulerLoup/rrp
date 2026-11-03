@@ -6,11 +6,9 @@ use clap::Parser;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
-use rrp::cli::{
-    Cli, Commands, RunMode, DEFAULT_CLIENT_CONFIG_PATH, DEFAULT_SERVER_CONFIG_PATH,
-};
+use rrp::cli::{Cli, Commands, RunMode, DEFAULT_CLIENT_CONFIG_PATH, DEFAULT_SERVER_CONFIG_PATH};
 use rrp::client::run_client;
-use rrp::config::{approve_client_key, install_client_key, ClientConfig, ServerConfig};
+use rrp::config::{approve_client_key, install_client_key_with, ClientConfig, ServerConfig};
 use rrp::server::run_server;
 use rrp::service::{install_autostart_service, uninstall_rrp, ServicePlatform};
 use rrp::status::{load_statuses, render_human, render_json};
@@ -47,6 +45,7 @@ async fn main() -> Result<()> {
             config,
             autostart,
             service_dir,
+            regenerate_key,
         } => {
             let cfg_path = config.unwrap_or_else(|| match mode {
                 RunMode::Client => PathBuf::from(DEFAULT_CLIENT_CONFIG_PATH),
@@ -55,21 +54,36 @@ async fn main() -> Result<()> {
 
             match mode {
                 RunMode::Client => {
-                    let (_priv_key, pub_key) = install_client_key(&cfg_path)?;
-                    println!("Generated mlkem768x25519 keypair and wrote private_key to {}", cfg_path.display());
+                    let installed = install_client_key_with(&cfg_path, regenerate_key)?;
+                    if installed.generated {
+                        println!(
+                            "Generated mlkem768x25519 keypair and wrote private_key to {}",
+                            cfg_path.display()
+                        );
+                    } else {
+                        println!(
+                            "Kept existing mlkem768x25519 keypair in {} (use --regenerate-key to rotate)",
+                            cfg_path.display()
+                        );
+                    }
                     println!("Public key (run `rrp approve` on server):");
-                    println!("{}", pub_key);
+                    println!("{}", installed.public_key);
                 }
                 RunMode::Server => {
-                    if !cfg_path.exists() {
+                    if cfg_path.exists() {
+                        // Validate rather than touch an existing file.
+                        ServerConfig::load(&cfg_path)?;
+                        println!("Server config already present at {}", cfg_path.display());
+                    } else {
                         ServerConfig::default().save(&cfg_path)?;
+                        println!("Initialized server config at {}", cfg_path.display());
                     }
-                    println!("Initialized server config at {}", cfg_path.display());
                 }
             }
 
             if autostart {
-                let exe_path = env::current_exe().unwrap_or_else(|_| PathBuf::from("/usr/local/bin/rrp"));
+                let exe_path =
+                    env::current_exe().unwrap_or_else(|_| PathBuf::from("/usr/local/bin/rrp"));
                 let platform = ServicePlatform::current();
                 let service_file = install_autostart_service(
                     platform,
@@ -135,10 +149,7 @@ async fn main() -> Result<()> {
                     config.display()
                 );
             } else {
-                println!(
-                    "Public key already exists in {}",
-                    config.display()
-                );
+                println!("Public key already exists in {}", config.display());
             }
             Ok(())
         }

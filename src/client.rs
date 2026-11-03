@@ -6,9 +6,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, bail, Context, Result};
 use bytes::Bytes;
 use dashmap::DashMap;
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinSet;
-use tokio::time::{interval, timeout};
+use tokio::time::{interval, timeout, MissedTickBehavior};
 use tracing::{debug, error, info, warn};
 
 use crate::cli::RunMode;
@@ -16,18 +17,27 @@ use crate::config::{ClientConfig, ProxyConfig, ResolvedServerConfig};
 use crate::crypto::{client_handshake, ClientKeyPair};
 use crate::ebpf::EbpfAccelerator;
 use crate::net_utils::{
-    bind_ephemeral_udp_for_target, connect_tcp, format_server_proxy_addr, resolve_socket_addrs,
+    bind_ephemeral_udp_for_target, connect_tcp, connect_tcp_addr, format_server_proxy_addr,
+    resolve_socket_addrs,
 };
 use crate::protocol::{ControlSignal, ProxySpec, RoleHandshake, TunnelFrame};
 use crate::relay::relay_encrypted_and_plain_with_status;
-use crate::status::{
-    wait_for_shutdown_signal, ConnectionStatus, RuntimeStatus, StatusReporter,
-};
+use crate::status::{wait_for_shutdown_signal, ConnectionStatus, RuntimeStatus, StatusReporter};
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
-const RECONNECT_DELAY: Duration = Duration::from_secs(2);
+/// First retry happens quickly; subsequent failures back off exponentially up to the maximum so a
+/// server that is down for hours is not hammered (and the log not flooded) every two seconds.
+const RECONNECT_DELAY_INITIAL: Duration = Duration::from_secs(2);
+const RECONNECT_DELAY_MAX: Duration = Duration::from_secs(60);
 const UDP_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const UDP_MAX_PACKET_SIZE: usize = 65535;
+/// Per-visitor queue of datagrams waiting to be delivered to the local service.
+const UDP_SESSION_QUEUE_LEN: usize = 256;
+/// Datagrams queued from all local services towards one server's control channel.
+const UDP_OUTBOUND_QUEUE_LEN: usize = 1024;
+/// Upper bound on simultaneously tracked UDP visitors per server session. Each session owns a
+/// socket and a task, so an unbounded number would let a spoofed-source flood exhaust the client.
+const UDP_MAX_SESSIONS: usize = 4096;
 
 #[derive(Clone)]
 struct ServerEndpoint {
@@ -86,11 +96,7 @@ impl Client {
     pub fn new(config: ClientConfig) -> Result<Self> {
         let resolved_servers = config.resolve_servers()?;
         let ebpf = EbpfAccelerator::try_init(config.enable_ebpf);
-        let status = RuntimeStatus::new(
-            RunMode::Client,
-            ebpf.status_reason().to_string(),
-            None,
-        );
+        let status = RuntimeStatus::new(RunMode::Client, ebpf.status_reason().to_string(), None);
 
         let multi_server = resolved_servers.len() > 1;
         let mut endpoints = Vec::with_capacity(resolved_servers.len());
@@ -180,8 +186,7 @@ impl Client {
             .endpoints
             .iter()
             .find(|e| {
-                e.resolved.server_addr == target
-                    || e.resolved.name.as_deref() == Some(target)
+                e.resolved.server_addr == target || e.resolved.name.as_deref() == Some(target)
             })
             .ok_or_else(|| anyhow!("no configured server matching '{}'", target))?;
 
@@ -191,7 +196,10 @@ impl Client {
     /// Establish control session(s) with all configured servers concurrently.
     /// If `ready_tx` is provided, sends `Ok(())` once all configured servers acknowledge
     /// proxy registration (`RegisterAck`), or `Err` if any server fails registration.
-    pub async fn run_session(&self, mut ready_tx: Option<oneshot::Sender<Result<()>>>) -> Result<()> {
+    pub async fn run_session(
+        &self,
+        mut ready_tx: Option<oneshot::Sender<Result<()>>>,
+    ) -> Result<()> {
         if self.endpoints.len() == 1 {
             return run_endpoint_session(&self.endpoints[0], &self.ebpf, ready_tx).await;
         }
@@ -205,9 +213,8 @@ impl Client {
             let (ep_tx, ep_rx) = oneshot::channel();
             ready_rxs.push((endpoint.display_name(), ep_rx));
 
-            join_set.spawn(async move {
-                run_endpoint_session(&endpoint, &ebpf, Some(ep_tx)).await
-            });
+            join_set
+                .spawn(async move { run_endpoint_session(&endpoint, &ebpf, Some(ep_tx)).await });
         }
 
         for (srv_name, rx) in ready_rxs {
@@ -226,7 +233,10 @@ impl Client {
                     let err_msg = if let Some(Ok(Err(task_err))) = join_set.join_next().await {
                         format!("server {} session failed: {:#}", srv_name, task_err)
                     } else {
-                        format!("server {} session terminated before registration completed", srv_name)
+                        format!(
+                            "server {} session terminated before registration completed",
+                            srv_name
+                        )
                     };
                     if let Some(tx) = ready_tx.take() {
                         let _ = tx.send(Err(anyhow!("{}", err_msg)));
@@ -263,7 +273,10 @@ impl Client {
     /// Each server connection is isolated: if one server disconnects or is temporarily unreachable,
     /// other servers continue forwarding traffic while the disconnected server retries in the background.
     /// If `ready_tx` is provided, sends `Ok(())` once all configured servers have registered at least once.
-    pub async fn run_with_ready(&self, ready_tx: Option<oneshot::Sender<Result<()>>>) -> Result<()> {
+    pub async fn run_with_ready(
+        &self,
+        ready_tx: Option<oneshot::Sender<Result<()>>>,
+    ) -> Result<()> {
         let mut join_set = JoinSet::new();
         let mut ready_rxs = Vec::new();
 
@@ -279,12 +292,14 @@ impl Client {
             };
 
             join_set.spawn(async move {
+                let mut reconnect_delay = RECONNECT_DELAY_INITIAL;
                 loop {
                     let (attempt_tx, attempt_rx) = oneshot::channel();
                     let session_fut = run_endpoint_session(&endpoint, &ebpf, Some(attempt_tx));
 
                     tokio::pin!(session_fut);
                     let mut attempt_rx_opt = Some(attempt_rx);
+                    let mut registered = false;
 
                     let res = loop {
                         tokio::select! {
@@ -297,6 +312,7 @@ impl Client {
                             } => {
                                 attempt_rx_opt = None;
                                 if let Ok(Ok(())) = attempt_res {
+                                    registered = true;
                                     if let Some(tx) = ep_ready_tx.take() {
                                         let _ = tx.send(());
                                     }
@@ -305,12 +321,18 @@ impl Client {
                         }
                     };
 
+                    // A session that registered successfully resets the back-off: the next
+                    // failure is a fresh incident, not a continuation of an outage.
+                    if registered {
+                        reconnect_delay = RECONNECT_DELAY_INITIAL;
+                    }
+
                     match res {
                         Ok(()) => {
                             warn!(
                                 "client control session for server {} closed; reconnecting in {:?}...",
                                 endpoint.display_name(),
-                                RECONNECT_DELAY
+                                reconnect_delay
                             );
                         }
                         Err(e) => {
@@ -318,11 +340,12 @@ impl Client {
                                 "client session for server {} disconnected: {:#}; retrying in {:?}...",
                                 endpoint.display_name(),
                                 e,
-                                RECONNECT_DELAY
+                                reconnect_delay
                             );
                         }
                     }
-                    tokio::time::sleep(RECONNECT_DELAY).await;
+                    tokio::time::sleep(reconnect_delay).await;
+                    reconnect_delay = (reconnect_delay * 2).min(RECONNECT_DELAY_MAX);
                 }
             });
         }
@@ -368,6 +391,15 @@ async fn run_endpoint_session(
     result
 }
 
+/// Live state of one UDP visitor session: the queue feeding its socket task and a generation
+/// number so a finished task only removes its own map entry, never a successor's.
+struct UdpSessionHandle {
+    generation: u64,
+    tx: mpsc::Sender<Bytes>,
+}
+
+type UdpSessions = Arc<DashMap<(String, SocketAddr), UdpSessionHandle>>;
+
 async fn run_endpoint_session_inner(
     endpoint: &ServerEndpoint,
     ebpf: &EbpfAccelerator,
@@ -379,10 +411,20 @@ async fn run_endpoint_session_inner(
     let tcp = connect_tcp(server_addr)
         .await
         .with_context(|| format!("failed to connect to rrp server at {}", display_name))?;
+    // Work connections dial the exact address the control session landed on, so they never
+    // re-resolve a hostname (and never land on a different host than the session they serve).
+    let server_socket_addr = tcp
+        .peer_addr()
+        .with_context(|| format!("failed to query peer address of server {}", display_name))?;
 
     let mut enc_stream = timeout(HANDSHAKE_TIMEOUT, client_handshake(tcp, &endpoint.keypair))
         .await
-        .with_context(|| format!("mlkem768x25519plus client handshake timed out for {}", display_name))??;
+        .with_context(|| {
+            format!(
+                "mlkem768x25519plus client handshake timed out for {}",
+                display_name
+            )
+        })??;
 
     info!(
         "authenticated control connection to server {}",
@@ -407,8 +449,18 @@ async fn run_endpoint_session_inner(
 
     let ack_raw = timeout(HANDSHAKE_TIMEOUT, enc_stream.recv_frame())
         .await
-        .with_context(|| format!("timed out waiting for RegisterAck from server {}", display_name))??
-        .ok_or_else(|| anyhow!("server {} closed connection before RegisterAck", display_name))?;
+        .with_context(|| {
+            format!(
+                "timed out waiting for RegisterAck from server {}",
+                display_name
+            )
+        })??
+        .ok_or_else(|| {
+            anyhow!(
+                "server {} closed connection before RegisterAck",
+                display_name
+            )
+        })?;
 
     match TunnelFrame::decode(ack_raw)? {
         TunnelFrame::Signal(ControlSignal::RegisterAck { success, message }) => {
@@ -444,14 +496,35 @@ async fn run_endpoint_session_inner(
     }
 
     let (mut enc_read, mut enc_write) = enc_stream.into_split();
+    // Heartbeats must never be starved by bulk UDP replies, so they travel on their own channel
+    // and the writer prefers it; datagrams are dropped (not buffered forever) under back-pressure.
     let (ctrl_tx, mut ctrl_rx) = mpsc::unbounded_channel::<TunnelFrame>();
+    let (udp_tx, mut udp_rx) = mpsc::channel::<TunnelFrame>(UDP_OUTBOUND_QUEUE_LEN);
 
     let writer_handle = tokio::spawn(async move {
-        while let Some(frame) = ctrl_rx.recv().await {
-            if let Ok(bytes) = frame.encode() {
-                if enc_write.send_frame(&bytes).await.is_err() {
-                    break;
+        let mut udp_open = true;
+        loop {
+            let frame = tokio::select! {
+                biased;
+                maybe_frame = ctrl_rx.recv() => match maybe_frame {
+                    Some(frame) => frame,
+                    None => break,
+                },
+                maybe_frame = udp_rx.recv(), if udp_open => match maybe_frame {
+                    Some(frame) => frame,
+                    None => {
+                        udp_open = false;
+                        continue;
+                    }
+                },
+            };
+            match frame.encode() {
+                Ok(bytes) => {
+                    if enc_write.send_frame(&bytes).await.is_err() {
+                        break;
+                    }
                 }
+                Err(e) => debug!("dropping unencodable tunnel frame: {:#}", e),
             }
         }
     });
@@ -460,6 +533,7 @@ async fn run_endpoint_session_inner(
     let hb_tx = ctrl_tx.clone();
     let hb_handle = tokio::spawn(async move {
         let mut ticker = interval(Duration::from_secs(hb_secs));
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
         loop {
             ticker.tick().await;
             let now_ms = SystemTime::now()
@@ -477,8 +551,8 @@ async fn run_endpoint_session_inner(
         }
     });
 
-    let udp_sessions: Arc<DashMap<(String, SocketAddr), mpsc::Sender<Bytes>>> =
-        Arc::new(DashMap::new());
+    let udp_sessions: UdpSessions = Arc::new(DashMap::new());
+    let mut udp_generation: u64 = 0;
     let read_timeout = Duration::from_secs(hb_secs.saturating_mul(3).max(15));
 
     let read_res: Result<()> = async {
@@ -516,7 +590,6 @@ async fn run_endpoint_session_inner(
                         );
                         continue;
                     };
-                    let server_addr = endpoint.resolved.server_addr.clone();
                     let keypair = endpoint.keypair.clone();
                     let ebpf = ebpf.clone();
                     let Some(status) = endpoint.proxy_status(&proxy_name) else {
@@ -528,7 +601,7 @@ async fn run_endpoint_session_inner(
                             conn_id,
                             proxy_cfg,
                             visitor_addr,
-                            server_addr,
+                            server_socket_addr,
                             keypair,
                             ebpf,
                             status,
@@ -567,31 +640,60 @@ async fn run_endpoint_session_inner(
                     };
                     status.record_received(payload.len());
                     let key = (proxy_name.clone(), visitor_addr);
-                    if let Some(existing_tx) = udp_sessions.get(&key) {
-                        if existing_tx.try_send(payload.clone()).is_ok() {
-                            continue;
-                        }
+
+                    // Deliver to the existing session when there is one. A full queue means the
+                    // local service is slower than the visitor: drop this datagram (UDP semantics)
+                    // rather than spawning a competing session for the same visitor.
+                    let payload = match udp_sessions.get(&key) {
+                        Some(session) => match session.tx.try_send(payload) {
+                            Ok(()) => continue,
+                            Err(TrySendError::Full(_)) => {
+                                debug!(
+                                    "UDP session {}:{} queue full, dropping datagram",
+                                    proxy_name, visitor_addr
+                                );
+                                continue;
+                            }
+                            Err(TrySendError::Closed(payload)) => payload,
+                        },
+                        None => payload,
+                    };
+
+                    if udp_sessions.len() >= UDP_MAX_SESSIONS {
+                        warn!(
+                            "UDP session limit ({}) reached on server {}, dropping datagram from {}",
+                            UDP_MAX_SESSIONS, display_name, visitor_addr
+                        );
+                        continue;
                     }
 
-                    let (pkt_tx, pkt_rx) = mpsc::channel::<Bytes>(256);
+                    let (pkt_tx, pkt_rx) = mpsc::channel::<Bytes>(UDP_SESSION_QUEUE_LEN);
                     let _ = pkt_tx.try_send(payload);
-                    udp_sessions.insert(key.clone(), pkt_tx);
+                    udp_generation += 1;
+                    let generation = udp_generation;
+                    udp_sessions.insert(
+                        key.clone(),
+                        UdpSessionHandle {
+                            generation,
+                            tx: pkt_tx,
+                        },
+                    );
 
                     let sessions_clone = Arc::clone(&udp_sessions);
-                    let ctrl_tx_clone = ctrl_tx.clone();
+                    let udp_tx_clone = udp_tx.clone();
                     tokio::spawn(async move {
                         if let Err(e) = run_udp_session(
                             proxy_cfg,
                             visitor_addr,
                             pkt_rx,
-                            ctrl_tx_clone,
+                            udp_tx_clone,
                             status,
                         )
                         .await
                         {
                             debug!("UDP session for visitor {} ended: {:#}", visitor_addr, e);
                         }
-                        sessions_clone.remove(&key);
+                        sessions_clone.remove_if(&key, |_, session| session.generation == generation);
                     });
                 }
             }
@@ -610,7 +712,7 @@ async fn handle_work_tcp(
     conn_id: u64,
     proxy_cfg: ProxyConfig,
     visitor_addr: String,
-    server_addr: String,
+    server_addr: SocketAddr,
     keypair: ClientKeyPair,
     ebpf: EbpfAccelerator,
     status: ConnectionStatus,
@@ -618,10 +720,8 @@ async fn handle_work_tcp(
     let local_addr = proxy_cfg.resolved_local_addr()?;
 
     // Connect to local target service (supports IPv4 or IPv6 transparently) and server in parallel
-    let (local_res, server_res) = tokio::join!(
-        connect_tcp(&local_addr),
-        connect_tcp(&server_addr)
-    );
+    let (local_res, server_res) =
+        tokio::join!(connect_tcp(&local_addr), connect_tcp_addr(server_addr));
 
     let local_stream = local_res.with_context(|| {
         format!(
@@ -656,7 +756,7 @@ async fn run_udp_session(
     proxy_cfg: ProxyConfig,
     visitor_addr: SocketAddr,
     mut pkt_rx: mpsc::Receiver<Bytes>,
-    ctrl_tx: mpsc::UnboundedSender<TunnelFrame>,
+    udp_tx: mpsc::Sender<TunnelFrame>,
     status: ConnectionStatus,
 ) -> Result<()> {
     let local_addr_str = proxy_cfg.resolved_local_addr()?;
@@ -664,8 +764,16 @@ async fn run_udp_session(
     let target_addr = resolved_addrs[0];
 
     // Bind ephemeral UDP socket matching target_addr's IP version (V4 or V6),
-    // enabling seamless IPv4 <-> IPv6 UDP translation!
+    // enabling seamless IPv4 <-> IPv6 UDP translation. Connecting it makes the kernel discard
+    // datagrams from any other source and surfaces ICMP "port unreachable" as an error, so a
+    // session towards a dead local service ends immediately instead of idling for a minute.
     let local_udp = bind_ephemeral_udp_for_target(target_addr)?;
+    local_udp.connect(target_addr).await.with_context(|| {
+        format!(
+            "failed to connect UDP socket to local service {}",
+            target_addr
+        )
+    })?;
     let mut recv_buf = vec![0u8; UDP_MAX_PACKET_SIZE];
 
     loop {
@@ -673,23 +781,29 @@ async fn run_udp_session(
             maybe_outbound = pkt_rx.recv() => {
                 match maybe_outbound {
                     Some(payload) => {
-                        local_udp.send_to(&payload, target_addr).await?;
+                        local_udp.send(&payload).await?;
                     }
                     None => break,
                 }
             }
-            recv_res = timeout(UDP_SESSION_IDLE_TIMEOUT, local_udp.recv_from(&mut recv_buf)) => {
+            recv_res = timeout(UDP_SESSION_IDLE_TIMEOUT, local_udp.recv(&mut recv_buf)) => {
                 match recv_res {
-                    Ok(Ok((n, _from_addr))) => {
+                    Ok(Ok(n)) => {
                         let reply = TunnelFrame::UdpDatagram {
                             proxy_name: proxy_cfg.name.clone(),
                             visitor_addr,
                             payload: Bytes::copy_from_slice(&recv_buf[..n]),
                         };
-                        if ctrl_tx.send(reply).is_err() {
-                            break;
+                        match udp_tx.try_send(reply) {
+                            Ok(()) => status.record_sent(n),
+                            Err(TrySendError::Full(_)) => {
+                                debug!(
+                                    "server link saturated, dropping UDP reply for visitor {}",
+                                    visitor_addr
+                                );
+                            }
+                            Err(TrySendError::Closed(_)) => break,
                         }
-                        status.record_sent(n);
                     }
                     Ok(Err(e)) => {
                         return Err(e.into());

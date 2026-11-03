@@ -246,10 +246,18 @@ impl RuntimeStatus {
             .inner
             .connections
             .iter()
-            .map(|entry| (entry.value().order, snapshot_connection(entry.value(), now_ms)))
+            .map(|entry| {
+                (
+                    entry.value().order,
+                    snapshot_connection(entry.value(), now_ms),
+                )
+            })
             .collect();
         connections.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.id.cmp(&b.1.id)));
-        let connections = connections.into_iter().map(|(_, snapshot)| snapshot).collect();
+        let connections = connections
+            .into_iter()
+            .map(|(_, snapshot)| snapshot)
+            .collect();
 
         StatusSnapshot {
             schema_version: STATUS_SCHEMA_VERSION,
@@ -889,7 +897,8 @@ mod tests {
 
         let output = render_human(&[runtime.snapshot()]);
         assert!(output.contains("RRP SERVER — RUNNING (PID "));
-        assert!(output.contains("    - example_tcp [connected]\n      tcp [::]:18080 -> 127.0.0.1:8080\n"));
+        assert!(output
+            .contains("    - example_tcp [connected]\n      tcp [::]:18080 -> 127.0.0.1:8080\n"));
         assert!(output.contains("Connected for:"));
         assert!(output.contains("Traffic:"));
         assert!(output.contains("Last heartbeat:"));

@@ -1,10 +1,78 @@
+use std::collections::HashMap;
 use std::fs;
+use std::io::Write;
+use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::crypto::{generate_keypair, AuthorizedPublicKey, ClientKeyPair};
+use crate::net_utils::split_host_port;
+
+/// Private keys live in the client config, so it must never be world-readable.
+#[cfg(unix)]
+const CLIENT_CONFIG_MODE: u32 = 0o600;
+
+/// Write `content` to `path` atomically (temp file + rename) so a crash mid-write never leaves a
+/// truncated config behind, optionally forcing a Unix permission mode on the result.
+fn write_file_atomic(path: &Path, content: &str, #[allow(unused)] mode: Option<u32>) -> Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)
+        .with_context(|| format!("failed to create config directory {}", parent.display()))?;
+
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("config.toml");
+    let temporary_path = parent.join(format!(".{}.{}.tmp", file_name, std::process::id()));
+
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    if let Some(mode) = mode {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(mode);
+    }
+    let result = (|| -> Result<()> {
+        let mut file = options
+            .open(&temporary_path)
+            .with_context(|| format!("failed to create {}", temporary_path.display()))?;
+        file.write_all(content.as_bytes())
+            .with_context(|| format!("failed to write {}", temporary_path.display()))?;
+        file.sync_all()
+            .with_context(|| format!("failed to flush {}", temporary_path.display()))?;
+        #[cfg(unix)]
+        if let Some(mode) = mode {
+            use std::os::unix::fs::PermissionsExt;
+            // The mode on open() is masked by umask; enforce the exact mode afterwards.
+            fs::set_permissions(&temporary_path, fs::Permissions::from_mode(mode)).with_context(
+                || format!("failed to set permissions on {}", temporary_path.display()),
+            )?;
+        }
+        fs::rename(&temporary_path, path)
+            .with_context(|| format!("failed to replace {}", path.display()))?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary_path);
+    }
+    result
+}
+
+/// Parse a bind/remote IP as written in configs (`::`, `0.0.0.0`, `[::1]`, `127.0.0.1`).
+fn validate_ip_literal(value: &str, what: &str) -> Result<IpAddr> {
+    let trimmed = value.trim();
+    let bare = trimmed
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+        .unwrap_or(trimmed);
+    bare.parse::<IpAddr>()
+        .with_context(|| format!("{} '{}' is not a valid IP address", what, value))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -83,9 +151,12 @@ impl ProxyConfig {
             }
         }
         let ip = self.local_ip.as_deref().unwrap_or("127.0.0.1").trim();
-        let port = self
-            .local_port
-            .ok_or_else(|| anyhow::anyhow!("proxy '{}' must specify either `local_addr` or `local_port`", self.name))?;
+        let port = self.local_port.ok_or_else(|| {
+            anyhow::anyhow!(
+                "proxy '{}' must specify either `local_addr` or `local_port`",
+                self.name
+            )
+        })?;
         if ip.contains(':') && !ip.starts_with('[') {
             Ok(format!("[{}]:{}", ip, port))
         } else {
@@ -122,9 +193,62 @@ impl ProxyConfig {
         if self.remote_port == 0 {
             bail!("proxy '{}' remote_port cannot be 0", self.name);
         }
-        let _ = self.resolved_local_addr()?;
+        let local_addr = self.resolved_local_addr()?;
+        split_host_port(&local_addr).with_context(|| {
+            format!(
+                "proxy '{}' local address '{}' must be in `host:port` or `[ipv6]:port` form",
+                self.name, local_addr
+            )
+        })?;
+        if let Some(bind_ip) = &self.remote_bind_ip {
+            validate_ip_literal(bind_ip, &format!("proxy '{}' remote_bind_ip", self.name))?;
+        }
         Ok(())
     }
+
+    /// Key identifying the server-side socket this proxy occupies, used to detect two proxies on
+    /// the same server that would fight over one `remote_bind_ip:remote_port`.
+    fn remote_socket_key(&self) -> (String, u16) {
+        let bind_ip = self
+            .remote_bind_ip
+            .as_deref()
+            .map(|ip| ip.trim().trim_matches(|c| c == '[' || c == ']').to_string())
+            .unwrap_or_default();
+        (bind_ip, self.remote_port)
+    }
+}
+
+/// Reject proxies on one server whose TCP or UDP side would bind the same remote socket; the
+/// server would otherwise refuse the whole registration at runtime with a less helpful error.
+fn check_remote_port_conflicts(endpoint: &ResolvedServerConfig) -> Result<()> {
+    let mut tcp_owners: HashMap<(String, u16), &str> = HashMap::new();
+    let mut udp_owners: HashMap<(String, u16), &str> = HashMap::new();
+    for proxy in &endpoint.proxies {
+        let key = proxy.remote_socket_key();
+        if proxy.proxy_type.has_tcp() {
+            if let Some(other) = tcp_owners.insert(key.clone(), proxy.name.as_str()) {
+                bail!(
+                    "proxies '{}' and '{}' both bind TCP remote_port {} on server '{}'",
+                    other,
+                    proxy.name,
+                    proxy.remote_port,
+                    endpoint.display_name()
+                );
+            }
+        }
+        if proxy.proxy_type.has_udp() {
+            if let Some(other) = udp_owners.insert(key, proxy.name.as_str()) {
+                bail!(
+                    "proxies '{}' and '{}' both bind UDP remote_port {} on server '{}'",
+                    other,
+                    proxy.name,
+                    proxy.remote_port,
+                    endpoint.display_name()
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -180,17 +304,22 @@ impl ServerConfig {
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                fs::create_dir_all(parent)?;
-            }
-        }
         let content = toml::to_string_pretty(self).context("failed to serialize ServerConfig")?;
-        fs::write(path, content)
+        write_file_atomic(path, &content, None)
             .with_context(|| format!("failed to write server config to {}", path.display()))
     }
 
     pub fn validate(&self) -> Result<()> {
+        self.bind_addr
+            .trim()
+            .parse::<SocketAddr>()
+            .with_context(|| {
+                format!(
+                    "server `bind_addr` '{}' is not a valid socket address",
+                    self.bind_addr
+                )
+            })?;
+        validate_ip_literal(&self.proxy_bind_ip, "server `proxy_bind_ip`")?;
         for key in &self.authorized_keys {
             AuthorizedPublicKey::from_base64(key)?;
         }
@@ -335,13 +464,12 @@ impl ClientConfig {
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                fs::create_dir_all(parent)?;
-            }
-        }
         let content = toml::to_string_pretty(self).context("failed to serialize ClientConfig")?;
-        fs::write(path, content)
+        #[cfg(unix)]
+        let mode = Some(CLIENT_CONFIG_MODE);
+        #[cfg(not(unix))]
+        let mode = None;
+        write_file_atomic(path, &content, mode)
             .with_context(|| format!("failed to write client config to {}", path.display()))
     }
 
@@ -521,6 +649,7 @@ impl ClientConfig {
         }
 
         for ep in &endpoints {
+            check_remote_port_conflicts(ep)?;
             if ep.private_key.trim().is_empty() {
                 bail!(
                     "client `private_key` is missing for server '{}'; run `rrp install` first",
@@ -528,7 +657,10 @@ impl ClientConfig {
                 );
             }
             ClientKeyPair::from_base64(&ep.private_key).with_context(|| {
-                format!("invalid client `private_key` for server '{}'", ep.display_name())
+                format!(
+                    "invalid client `private_key` for server '{}'",
+                    ep.display_name()
+                )
             })?;
         }
 
@@ -541,30 +673,81 @@ impl ClientConfig {
     }
 }
 
-/// Generate a new mlkem768x25519 keypair and write the private key to the client config at `path`.
-/// Returns `(private_key_b64, public_key_b64)`.
-pub fn install_client_key(path: &Path) -> Result<(String, String)> {
-    let (priv_b64, pub_b64) = generate_keypair();
+/// Outcome of `install_client_key_with`: whether a new keypair was generated or an existing one
+/// was kept.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstalledClientKey {
+    pub private_key: String,
+    pub public_key: String,
+    pub generated: bool,
+}
+
+/// Ensure the client config at `path` holds a mlkem768x25519 private key, generating one if the
+/// file does not exist or has no usable key. An existing valid key is preserved unless
+/// `regenerate` is set: re-running `rrp install` to add autostart must not silently rotate the key
+/// and invalidate the public key already approved on the server.
+///
+/// A config file that exists but cannot be parsed is an error, never silently replaced.
+pub fn install_client_key_with(path: &Path, regenerate: bool) -> Result<InstalledClientKey> {
     let mut cfg = if path.exists() {
-        let content = fs::read_to_string(path)?;
-        toml::from_str::<ClientConfig>(&content).unwrap_or_default()
+        ClientConfig::load_unvalidated(path).with_context(|| {
+            format!(
+                "refusing to overwrite unreadable client config {} (fix or remove it first)",
+                path.display()
+            )
+        })?
     } else {
         ClientConfig::default()
     };
     if cfg.server_addr.trim().is_empty() && cfg.server_addrs.is_empty() && cfg.servers.is_empty() {
         cfg.server_addr = default_client_server_addr();
     }
+
+    if !regenerate {
+        if let Ok(existing) = ClientKeyPair::from_base64(&cfg.private_key) {
+            let public_key = existing.public_key_base64();
+            // Re-save so permissions and formatting are normalized even when nothing changed.
+            cfg.save(path)?;
+            return Ok(InstalledClientKey {
+                private_key: cfg.private_key.trim().to_string(),
+                public_key,
+                generated: false,
+            });
+        }
+    }
+
+    let (priv_b64, pub_b64) = generate_keypair();
     cfg.private_key = priv_b64.clone();
     cfg.save(path)?;
-    Ok((priv_b64, pub_b64))
+    Ok(InstalledClientKey {
+        private_key: priv_b64,
+        public_key: pub_b64,
+        generated: true,
+    })
+}
+
+/// Ensure a mlkem768x25519 keypair exists in the client config at `path`, keeping any existing
+/// valid key. Returns `(private_key_b64, public_key_b64)`.
+pub fn install_client_key(path: &Path) -> Result<(String, String)> {
+    let installed = install_client_key_with(path, false)?;
+    Ok((installed.private_key, installed.public_key))
 }
 
 /// Approve a client public key and persist it into the server config at `path`.
 /// Returns `true` if newly added, `false` if already present.
+///
+/// A config file that exists but cannot be parsed is an error: replacing it with defaults would
+/// silently discard every previously approved key.
 pub fn approve_client_key(path: &Path, pubkey_b64: &str) -> Result<bool> {
     let mut cfg = if path.exists() {
-        let content = fs::read_to_string(path)?;
-        toml::from_str::<ServerConfig>(&content).unwrap_or_default()
+        let content = fs::read_to_string(path)
+            .with_context(|| format!("failed to read server config from {}", path.display()))?;
+        toml::from_str::<ServerConfig>(&content).with_context(|| {
+            format!(
+                "refusing to overwrite unreadable server config {} (fix or remove it first)",
+                path.display()
+            )
+        })?
     } else {
         ServerConfig::default()
     };
