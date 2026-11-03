@@ -33,8 +33,14 @@ CC="$(find_clang)" || {
 }
 
 # bpfel: BPF 字节码按小端编译，服务端目标 (x86_64 / aarch64 Linux) 均为小端。
+#
+# -ffreestanding -nostdlibinc: BPF 程序没有 libc，只用 clang 自带的 <stdint.h> /
+# <stddef.h> / <stdbool.h>，不再回落到宿主机的 glibc 头文件。否则在 Debian/Ubuntu 上
+# clang -target bpf 找不到多架构目录 (/usr/include/<arch>-linux-gnu) 里的
+# bits/libc-header-start.h，GitHub Actions 的 ubuntu runner 会编译失败。
 "$CC" -O2 -g -Wall -Wextra -Werror \
     -target bpfel \
+    -ffreestanding -nostdlibinc \
     -I "${SCRIPT_DIR}/include" \
     -c "$SRC" -o "$OUT"
 
