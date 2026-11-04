@@ -57,6 +57,17 @@ authorized_keys = [
 ]
 ```
 
+控制端口的准入限制（可选 `[handshake]` 段，均有默认值，详见第 8 节）：
+
+```toml
+[handshake]
+hello_timeout_secs = 3     # 每条握手消息的最长等待；Linux 上同时用作 TCP_DEFER_ACCEPT
+max_pending = 1024         # 全局同时处于握手中的连接数上限（0 为不限）
+max_pending_per_ip = 64    # 单个来源 IP 同时处于握手中的连接数上限（0 为不限）
+failure_limit = 10         # 一个 IP 在 ban_secs 内握手失败这么多次后被拒绝（0 为不封禁）
+ban_secs = 60              # 失败计数窗口，也是封禁时长
+```
+
 客户端 `rrpc.toml`（支持单服务端或多服务端同时注册、`tcp`/`udp`/`all` 及 IPv4/IPv6 互转）：
 
 ```toml
@@ -286,3 +297,22 @@ sudo sntp -sS time.apple.com
 两端时间校准完成后无需重启服务端，客户端会在下一次重连时重新握手。若客户端已在退避重连中，可直接重启客户端进程（`sudo systemctl restart rrp-client` 或 `sudo launchctl kickstart -k system/com.rrp.client`）以立即重试。
 
 常见原因：虚拟机/容器挂起后恢复导致时钟停滞、主机未启用 NTP、新装系统默认时间错误、硬件时钟（RTC）电池失效。若校时后仍反复出现偏差，请检查 NTP 服务是否持续运行，而非仅做了一次性校时。
+
+## 8. 控制端口防探测与防耗尽
+
+控制端口（默认 `3700`）上没有口令，只有 mlkem768x25519plus 公钥握手，不存在可爆破的凭证。服务端接受连接后先不发送任何字节，
+握手失败也不返回原因，扫描器只能看到端口开放，拿不到任何协议特征。认证前服务端对每个连接的投入被以下规则限制：
+
+- **逐条消息超时**：ClientHello、ClientFinish 各自必须在 `hello_timeout_secs`（默认 3 秒）内到达，否则断开。
+  格式错误、版本不符、key_id 未授权、时间戳超窗的连接在读到数据的瞬间就断开，不等待超时。
+- **内核先挡一层（Linux）**：监听 socket 启用 `TCP_DEFER_ACCEPT`，只连接不发数据的对端在 `hello_timeout_secs`
+  内留在内核里，不占用文件描述符和任务。
+- **并发上限**：同时处于握手中的连接数超过 `max_pending`（全局）或 `max_pending_per_ip`（单 IP）时，新连接在 accept
+  时直接关闭，不创建任务。认证完成后连接即不再计入，正常的工作连接只在握手的几十毫秒内占用名额。
+- **失败封禁**：一个 IP 在 `ban_secs` 内握手失败 `failure_limit` 次后，其后续连接在 `ban_secs` 内一律直接关闭，并打印一条
+  `WARN banning <ip> ...` 日志。静默超时、发送垃圾数据、使用未授权 key 都算失败；封禁期间的尝试不延长封禁。
+- **断开即复位**：认证前的连接以 RST 关闭而非 FIN，服务端不留 TIME_WAIT 状态。
+
+客户端重连间隔从 2 秒起指数退避到 60 秒，一个配置错误（如时钟偏差、公钥未 approve）的合法客户端一分钟内最多失败五六次，
+不会触发默认阈值；若确实被封，等 `ban_secs` 过去或重启服务端即可。中继模式下单客户端瞬时并发访客很多时，可调高
+`max_pending_per_ip`。这些限制不改变端口在 SYN 扫描中"开放"的事实，如需对未知来源完全隐藏端口，仍应配合防火墙放行名单。

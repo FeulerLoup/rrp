@@ -3,6 +3,7 @@ pub mod client;
 pub mod config;
 pub mod crypto;
 pub mod ebpf;
+pub mod guard;
 pub mod net_utils;
 pub mod protocol;
 pub mod relay;

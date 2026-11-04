@@ -16,10 +16,12 @@ use tracing::{debug, info, warn};
 
 use crate::cli::RunMode;
 use crate::config::ServerConfig;
-use crate::crypto::{key_id_hex, server_handshake, EncryptedStream, KeyId, ServerAuthorizer};
+use crate::crypto::{key_id_hex, server_handshake_timed, EncryptedStream, KeyId, ServerAuthorizer};
 use crate::ebpf::EbpfAccelerator;
+use crate::guard::{HandshakeGuard, HandshakePermit};
 use crate::net_utils::{
-    bind_tcp_listener, bind_udp_socket, format_bind_addr, normalize_socket_addr,
+    bind_tcp_listener, bind_tcp_listener_with, bind_udp_socket, format_bind_addr, graceful_close,
+    normalize_socket_addr, reset_on_close,
 };
 use crate::protocol::{
     ControlSignal, ProxySpec, RoleHandshake, TunnelBinding, TunnelFrame, TunnelRequest,
@@ -30,6 +32,8 @@ use crate::status::{wait_for_shutdown_signal, ConnectionStatus, RuntimeStatus, S
 use crate::tunnel::bpf_types::{FAMILY_V4, FAMILY_V6, PROTO_TCP, PROTO_UDP};
 use crate::tunnel::{ResolvedBinding, TunnelLease, TunnelServer};
 
+/// Upper bound on the whole pre-session exchange (crypto handshake plus `RoleHandshake`). The
+/// unauthenticated part is additionally bounded per message by `handshake.hello_timeout_secs`.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const WORK_CONN_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 const UDP_MAX_PACKET_SIZE: usize = 65535;
@@ -56,6 +60,7 @@ type PendingWorkConnections = Arc<DashMap<u64, PendingWorkConn>>;
 struct ServerRuntime {
     config: Arc<ServerConfig>,
     authorizer: ServerAuthorizer,
+    guard: Arc<HandshakeGuard>,
     pending_work_conns: PendingWorkConnections,
     next_conn_id: Arc<AtomicU64>,
     status: RuntimeStatus,
@@ -68,6 +73,7 @@ pub struct Server {
     listener: TcpListener,
     local_addr: SocketAddr,
     authorizer: ServerAuthorizer,
+    guard: Arc<HandshakeGuard>,
     ebpf: EbpfAccelerator,
     pending_work_conns: PendingWorkConnections,
     next_conn_id: Arc<AtomicU64>,
@@ -84,7 +90,10 @@ impl Server {
             );
         }
         let ebpf = EbpfAccelerator::try_init(config.enable_ebpf);
-        let listener = bind_tcp_listener(&config.bind_addr)?;
+        let guard = HandshakeGuard::new(config.handshake.clone());
+        // The rrp client always speaks first, so the kernel can hold silent connections back.
+        let listener =
+            bind_tcp_listener_with(&config.bind_addr, Some(config.handshake.hello_timeout()))?;
         let local_addr = listener
             .local_addr()
             .context("failed to query server local_addr")?;
@@ -105,6 +114,7 @@ impl Server {
             listener,
             local_addr,
             authorizer,
+            guard,
             ebpf,
             pending_work_conns: Arc::new(DashMap::new()),
             next_conn_id: Arc::new(AtomicU64::new(1)),
@@ -122,6 +132,11 @@ impl Server {
 
     pub fn status(&self) -> RuntimeStatus {
         self.status.clone()
+    }
+
+    /// Admission control state for the control port.
+    pub fn guard(&self) -> Arc<HandshakeGuard> {
+        Arc::clone(&self.guard)
     }
 
     /// Try to bring up the kernel tunnel data plane; on any failure keep serving with the
@@ -158,6 +173,7 @@ impl Server {
         let runtime = ServerRuntime {
             config: Arc::new(self.config),
             authorizer: self.authorizer,
+            guard: self.guard,
             pending_work_conns: self.pending_work_conns,
             next_conn_id: self.next_conn_id,
             status: self.status,
@@ -176,10 +192,24 @@ impl Server {
                 }
             };
             let peer_addr = normalize_socket_addr(peer_addr);
+
+            // Nothing is known about the peer yet. Until the handshake proves it holds an approved
+            // key, close on RST rather than FIN so refused and failed attempts leave no TIME_WAIT
+            // state and get no protocol-level answer.
+            reset_on_close(&stream);
+            let permit = match runtime.guard.try_admit(peer_addr.ip()) {
+                Ok(permit) => permit,
+                Err(refusal) => {
+                    debug!("refused connection from {}: {}", peer_addr, refusal);
+                    drop(stream);
+                    continue;
+                }
+            };
             let runtime = runtime.clone();
 
             tokio::spawn(async move {
-                if let Err(e) = handle_incoming_connection(stream, peer_addr, runtime).await {
+                if let Err(e) = handle_incoming_connection(stream, peer_addr, runtime, permit).await
+                {
                     debug!("connection from {} ended: {:#}", peer_addr, e);
                 }
             });
@@ -191,13 +221,29 @@ async fn handle_incoming_connection(
     stream: TcpStream,
     peer_addr: SocketAddr,
     runtime: ServerRuntime,
+    permit: HandshakePermit,
 ) -> Result<()> {
-    let (mut enc_stream, key_id) = timeout(
+    let handshake = timeout(
         HANDSHAKE_TIMEOUT,
-        server_handshake(stream, &runtime.authorizer),
+        server_handshake_timed(
+            stream,
+            &runtime.authorizer,
+            runtime.config.handshake.hello_timeout(),
+        ),
     )
     .await
-    .context("mlkem768x25519plus server handshake timed out")??;
+    .context("mlkem768x25519plus server handshake timed out")
+    .and_then(|result| result);
+    // The handshake slot is only needed while the peer is unauthenticated.
+    drop(permit);
+    let (mut enc_stream, key_id) = match handshake {
+        Ok(authenticated) => authenticated,
+        Err(error) => {
+            runtime.guard.record_failure(peer_addr.ip());
+            return Err(error);
+        }
+    };
+    graceful_close(enc_stream.get_ref());
 
     let role_frame = timeout(HANDSHAKE_TIMEOUT, enc_stream.recv_frame())
         .await

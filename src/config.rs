@@ -3,6 +3,7 @@ use std::fs;
 use std::io::Write;
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -337,6 +338,78 @@ impl TunnelServerConfig {
     }
 }
 
+/// Admission limits for the control port (`[handshake]` in `rrps.toml`). They bound what an
+/// unauthenticated peer can occupy before the mlkem768x25519plus handshake completes. A limit of
+/// `0` disables that limit.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HandshakeGuardConfig {
+    /// How long the server waits for each handshake message (`ClientHello`, `ClientFinish`)
+    /// before closing the connection. On Linux the same value is used for `TCP_DEFER_ACCEPT`, so
+    /// a peer that never sends anything does not reach user space at all for this long.
+    #[serde(default = "default_hello_timeout_secs")]
+    pub hello_timeout_secs: u64,
+    /// Connections allowed inside the handshake at the same time, over all peers.
+    #[serde(default = "default_max_pending")]
+    pub max_pending: u32,
+    /// Connections allowed inside the handshake at the same time from one IP address.
+    #[serde(default = "default_max_pending_per_ip")]
+    pub max_pending_per_ip: u32,
+    /// Failed handshakes from one IP address within `ban_secs` before it is refused outright.
+    #[serde(default = "default_failure_limit")]
+    pub failure_limit: u32,
+    /// Length of the failure-counting window and of the ban that follows it.
+    #[serde(default = "default_ban_secs")]
+    pub ban_secs: u64,
+}
+
+fn default_hello_timeout_secs() -> u64 {
+    3
+}
+
+fn default_max_pending() -> u32 {
+    1024
+}
+
+fn default_max_pending_per_ip() -> u32 {
+    64
+}
+
+fn default_failure_limit() -> u32 {
+    10
+}
+
+fn default_ban_secs() -> u64 {
+    60
+}
+
+impl Default for HandshakeGuardConfig {
+    fn default() -> Self {
+        Self {
+            hello_timeout_secs: default_hello_timeout_secs(),
+            max_pending: default_max_pending(),
+            max_pending_per_ip: default_max_pending_per_ip(),
+            failure_limit: default_failure_limit(),
+            ban_secs: default_ban_secs(),
+        }
+    }
+}
+
+impl HandshakeGuardConfig {
+    pub fn validate(&self) -> Result<()> {
+        if self.hello_timeout_secs == 0 {
+            bail!("`handshake.hello_timeout_secs` must be at least 1");
+        }
+        if self.failure_limit > 0 && self.ban_secs == 0 {
+            bail!("`handshake.ban_secs` must be at least 1 when `handshake.failure_limit` is set");
+        }
+        Ok(())
+    }
+
+    pub fn hello_timeout(&self) -> Duration {
+        Duration::from_secs(self.hello_timeout_secs)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerConfig {
     #[serde(default = "default_server_bind_addr")]
@@ -353,6 +426,9 @@ pub struct ServerConfig {
     pub heartbeat_timeout_secs: u64,
     #[serde(default)]
     pub tunnel: TunnelServerConfig,
+    /// Admission limits for the control port.
+    #[serde(default)]
+    pub handshake: HandshakeGuardConfig,
 }
 
 fn default_server_bind_addr() -> String {
@@ -380,6 +456,7 @@ impl Default for ServerConfig {
             enable_ebpf: true,
             heartbeat_timeout_secs: default_heartbeat_timeout_secs(),
             tunnel: TunnelServerConfig::default(),
+            handshake: HandshakeGuardConfig::default(),
         }
     }
 }
@@ -415,6 +492,7 @@ impl ServerConfig {
             AuthorizedPublicKey::from_base64(key)?;
         }
         self.tunnel.validate()?;
+        self.handshake.validate()?;
         Ok(())
     }
 

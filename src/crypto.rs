@@ -3,7 +3,7 @@ use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context as _, Result};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -18,6 +18,7 @@ use rand::rngs::OsRng;
 use rand::RngCore;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::time::timeout;
 use tracing::warn;
 use x25519_dalek::{
     EphemeralSecret, PublicKey as X25519PublicKey, StaticSecret as X25519StaticSecret,
@@ -34,6 +35,8 @@ pub const KEY_ID_LEN: usize = 32;
 
 const PROTOCOL_VERSION: u8 = 0x01;
 const HANDSHAKE_TIME_WINDOW_SECS: u64 = 300;
+/// Default wait for each client handshake message when the caller does not give one.
+pub const DEFAULT_HANDSHAKE_STEP_TIMEOUT: Duration = Duration::from_secs(3);
 const AEAD_TAG_LEN: usize = 16;
 /// Maximum plaintext length carried by a single encrypted frame. Larger payloads passed to
 /// `send_frame` are split into multiple frames (valid for byte streams); control messages and UDP
@@ -449,8 +452,25 @@ where
 /// Perform server-side mlkem768x25519plus post-quantum handshake and authenticate client.
 /// Returns the authenticated `EncryptedStream` and the matched client `KeyId`.
 pub async fn server_handshake<S>(
+    stream: S,
+    authorizer: &ServerAuthorizer,
+) -> Result<(EncryptedStream<S>, KeyId)>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    server_handshake_timed(stream, authorizer, DEFAULT_HANDSHAKE_STEP_TIMEOUT).await
+}
+
+/// Server side of the handshake with a bound on how long each client message may take to arrive.
+///
+/// A legitimate client sends `ClientHello` right after connecting and `ClientFinish` one round
+/// trip after `ServerHello`, so `step_timeout` only needs to cover a round trip plus the client's
+/// ML-KEM decapsulation. Everything before authentication is bounded by it, so a peer that
+/// connects and stays silent, or trickles bytes, is dropped after at most two of these timeouts.
+pub async fn server_handshake_timed<S>(
     mut stream: S,
     authorizer: &ServerAuthorizer,
+    step_timeout: Duration,
 ) -> Result<(EncryptedStream<S>, KeyId)>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -458,9 +478,14 @@ where
     // Read ClientHello fixed header:
     // version(1) || key_id(32) || client_eph_pk(32) || client_nonce(32) || timestamp(8) || pad_len(2) = 107 bytes
     let mut ch_fixed = [0u8; 1 + 32 + 32 + 32 + 8 + 2];
-    stream
-        .read_exact(&mut ch_fixed)
+    timeout(step_timeout, stream.read_exact(&mut ch_fixed))
         .await
+        .map_err(|_| {
+            anyhow!(
+                "no complete ClientHello within {:?} (silent or slow peer)",
+                step_timeout
+            )
+        })?
         .context("failed to read ClientHello header")?;
 
     let version = ch_fixed[0];
@@ -486,9 +511,14 @@ where
     }
 
     let mut pad_buf = vec![0u8; pad_len];
-    stream
-        .read_exact(&mut pad_buf)
+    timeout(step_timeout, stream.read_exact(&mut pad_buf))
         .await
+        .map_err(|_| {
+            anyhow!(
+                "ClientHello padding did not arrive within {:?}",
+                step_timeout
+            )
+        })?
         .context("failed to read ClientHello padding")?;
 
     let now = current_unix_secs();
@@ -570,9 +600,9 @@ where
 
     // Read ClientFinish: pad_len(2) || pad || encrypted_client_verify(48)
     let mut cf_pad_len_buf = [0u8; 2];
-    stream
-        .read_exact(&mut cf_pad_len_buf)
+    timeout(step_timeout, stream.read_exact(&mut cf_pad_len_buf))
         .await
+        .map_err(|_| anyhow!("ClientFinish did not arrive within {:?}", step_timeout))?
         .context("failed to read ClientFinish header")?;
     let cf_pad_len = u16::from_be_bytes(cf_pad_len_buf) as usize;
     if cf_pad_len > 512 {
@@ -580,9 +610,9 @@ where
     }
 
     let mut cf_tail = vec![0u8; cf_pad_len + 32 + AEAD_TAG_LEN];
-    stream
-        .read_exact(&mut cf_tail)
+    timeout(step_timeout, stream.read_exact(&mut cf_tail))
         .await
+        .map_err(|_| anyhow!("ClientFinish body did not arrive within {:?}", step_timeout))?
         .context("failed to read ClientFinish body")?;
 
     let client_verify_ct = &cf_tail[cf_pad_len..];

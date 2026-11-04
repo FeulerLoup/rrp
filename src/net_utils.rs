@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use rand::RngCore;
-use socket2::{Domain, Protocol, Socket, TcpKeepalive, Type};
+use socket2::{Domain, Protocol, SockRef, Socket, TcpKeepalive, Type};
 use tokio::net::{lookup_host, TcpListener, TcpStream, UdpSocket};
 use tokio::time::timeout;
 use tracing::warn;
@@ -455,7 +455,10 @@ fn ipv4_wildcard_fallback(addr: SocketAddr, error: &std::io::Error) -> Option<So
     ipv6_unavailable.then(|| SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), v6.port()))
 }
 
-fn bind_tcp_listener_at(addr: SocketAddr) -> std::io::Result<TcpListener> {
+fn bind_tcp_listener_at(
+    addr: SocketAddr,
+    defer_accept: Option<Duration>,
+) -> std::io::Result<TcpListener> {
     let domain = Domain::for_address(addr);
     let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
 
@@ -475,18 +478,74 @@ fn bind_tcp_listener_at(addr: SocketAddr) -> std::io::Result<TcpListener> {
     socket.set_nonblocking(true)?;
     socket.bind(&addr.into())?;
     socket.listen(1024)?;
+    if let Some(wait) = defer_accept {
+        set_tcp_defer_accept(&socket, wait);
+    }
 
     let std_listener: std::net::TcpListener = socket.into();
     TcpListener::from_std(std_listener)
 }
 
+/// `TCP_DEFER_ACCEPT`: the kernel keeps a completed connection out of the accept queue until the
+/// peer sends data or `wait` elapses. A port scanner or idle flood therefore occupies no file
+/// descriptor and no task on the server for that long. Only for listeners whose protocol has the
+/// client speak first, which the rrp control port does; a proxied service may greet first.
+#[cfg(target_os = "linux")]
+fn set_tcp_defer_accept(socket: &Socket, wait: Duration) {
+    use std::os::fd::AsRawFd;
+    let secs: libc::c_int = wait.as_secs().clamp(1, i32::MAX as u64) as libc::c_int;
+    // SAFETY: plain setsockopt on a socket we own, with a correctly sized c_int value.
+    let rc = unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::IPPROTO_TCP,
+            libc::TCP_DEFER_ACCEPT,
+            &secs as *const libc::c_int as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if rc != 0 {
+        warn!(
+            "failed to set TCP_DEFER_ACCEPT: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn set_tcp_defer_accept(_socket: &Socket, _wait: Duration) {}
+
+/// Make `close` send a RST instead of a FIN and skip TIME_WAIT. Used for connections the server
+/// refuses before authentication, so a flood leaves no lingering state behind and the peer gets
+/// nothing but a reset.
+///
+/// A zero linger never blocks on close (the kernel just emits the RST), which is why this does
+/// not go through tokio's deprecated `set_linger`.
+pub fn reset_on_close(stream: &TcpStream) {
+    let _ = SockRef::from(stream).set_linger(Some(Duration::ZERO));
+}
+
+/// Undo [`reset_on_close`] once a connection has authenticated.
+pub fn graceful_close(stream: &TcpStream) {
+    let _ = SockRef::from(stream).set_linger(None);
+}
+
 /// Bind a high-performance TCP listener supporting IPv4, IPv6, and dual-stack (`[::]:port`).
 pub fn bind_tcp_listener(addr_str: &str) -> Result<TcpListener> {
+    bind_tcp_listener_with(addr_str, None)
+}
+
+/// Like [`bind_tcp_listener`], additionally enabling `TCP_DEFER_ACCEPT` for `defer_accept` where
+/// the platform supports it (Linux). Use only when the client is the first to send data.
+pub fn bind_tcp_listener_with(
+    addr_str: &str,
+    defer_accept: Option<Duration>,
+) -> Result<TcpListener> {
     let addr: SocketAddr = addr_str
         .parse()
         .with_context(|| format!("invalid TCP bind address '{}'", addr_str))?;
 
-    match bind_tcp_listener_at(addr) {
+    match bind_tcp_listener_at(addr, defer_accept) {
         Ok(listener) => Ok(listener),
         Err(error) => {
             if let Some(v4_addr) = ipv4_wildcard_fallback(addr, &error) {
@@ -494,7 +553,7 @@ pub fn bind_tcp_listener(addr_str: &str) -> Result<TcpListener> {
                     "IPv6 appears unavailable ({}); binding TCP listener on {} instead of {}",
                     error, v4_addr, addr
                 );
-                return bind_tcp_listener_at(v4_addr)
+                return bind_tcp_listener_at(v4_addr, defer_accept)
                     .with_context(|| format!("failed to bind TCP socket on {}", v4_addr));
             }
             Err(error).with_context(|| format!("failed to bind TCP socket on {}", addr))
