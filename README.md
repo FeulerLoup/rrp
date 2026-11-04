@@ -233,7 +233,11 @@ WARN rrp::crypto: rejected ClientHello for key_id 08da8632eced9ee1: clock skew o
 # 查看同步状态（System clock synchronized: yes 表示已同步，NTP service: active 表示 NTP 已启用）
 timedatectl
 
-# 使用 systemd-timesyncd（大多数发行版默认自带）：启用 NTP 并立即生效
+# 若显示 NTP service: n/a，或 set-ntp 报 "NTP not supported"，说明系统没有任何 NTP 客户端
+# （Debian 12+ 的云镜像常见），先安装 systemd-timesyncd：
+sudo apt update && sudo apt install -y systemd-timesyncd
+
+# 启用 NTP 并立即生效
 sudo timedatectl set-ntp true
 
 # 若偏差较大，重启服务可触发立即校时
