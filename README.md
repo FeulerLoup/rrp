@@ -216,3 +216,69 @@ sudo rrp uninstall --mode client -c /usr/local/etc/rrp/rrpc.toml --purge
 - 默认不带 `--mode` 时会同时检查并卸载 `client` 与 `server` 自启服务；默认保留配置文件与 `rrp` 二进制。
 - 附加 `--purge` 时，除移除自启服务外，还会一并删除配置文件（自动识别服务文件中记录的 `-c` 路径、命令行 `-c` 指定路径或默认的 `/usr/local/etc/rrp/rrpc.toml`、`rrps.toml`，并在配置目录为空时自动清理目录）以及当前 `rrp` 二进制文件本身。
 
+
+## 7. 时间同步（时钟偏差导致握手被拒）
+
+握手时客户端会在 ClientHello 中携带当前 Unix 时间戳，服务端校验其与本机时间的偏差，超过 **300 秒**即拒绝连接（用于防重放），并在服务端日志中输出：
+
+```text
+WARN rrp::crypto: rejected ClientHello for key_id 08da8632eced9ee1: clock skew of 695s exceeds the 300s window (check NTP on both hosts)
+```
+
+出现该日志说明客户端与服务端两台主机的系统时间相差超过 5 分钟，需在**两端**都校准时间。先在两端各执行一次 `date -u` 对比 UTC 时间（与时区无关，只比较 UTC），再按系统类型处理。
+
+### Linux
+
+```bash
+# 查看同步状态（System clock synchronized: yes 表示已同步，NTP service: active 表示 NTP 已启用）
+timedatectl
+
+# 使用 systemd-timesyncd（大多数发行版默认自带）：启用 NTP 并立即生效
+sudo timedatectl set-ntp true
+
+# 若偏差较大，重启服务可触发立即校时
+sudo systemctl restart systemd-timesyncd
+timedatectl timesync-status
+```
+
+若系统使用 `chrony`（RHEL/CentOS/Rocky 默认，Debian/Ubuntu 可 `apt install chrony`）：
+
+```bash
+sudo systemctl enable --now chronyd    # Debian/Ubuntu 服务名为 chrony
+sudo chronyc makestep                   # 立即跳步校正，而非缓慢调整
+chronyc tracking                        # 查看当前偏差（System time 行）
+```
+
+若无法安装 NTP 服务（容器、精简系统等），可用 `ntpdate` / `sntp` 做一次性校时，并通过 cron 定期执行：
+
+```bash
+sudo apt install ntpsec-ntpdate   # 或 ntpdate / sntp
+sudo ntpdate -u pool.ntp.org
+```
+
+国内网络可将 NTP 服务器换为 `ntp.aliyun.com`、`ntp.tencent.com` 或 `cn.pool.ntp.org`，例如在 `/etc/systemd/timesyncd.conf` 中设置 `NTP=ntp.aliyun.com`，或在 `/etc/chrony.conf` 中添加 `server ntp.aliyun.com iburst`。
+
+### macOS
+
+```bash
+# 查看当前 NTP 服务器与是否启用
+sudo systemsetup -getnetworktimeserver
+sudo systemsetup -getusingnetworktime
+
+# 启用自动校时（等同于「系统设置 → 通用 → 日期与时间 → 自动设置时间与日期」）
+sudo systemsetup -setusingnetworktime on
+
+# 可选：更换 NTP 服务器（国内可用 ntp.aliyun.com）
+sudo systemsetup -setnetworktimeserver time.apple.com
+
+# 立即进行一次校时（仅查询不修改可加 -d）
+sudo sntp -sS time.apple.com
+```
+
+> 注意：macOS 上的 `sntp -sS` 会立即跳步修改系统时间；若仅想查看偏差，使用 `sntp -d time.apple.com`。
+
+### 校准后
+
+两端时间校准完成后无需重启服务端，客户端会在下一次重连时重新握手。若客户端已在退避重连中，可直接重启客户端进程（`sudo systemctl restart rrp-client` 或 `sudo launchctl kickstart -k system/com.rrp.client`）以立即重试。
+
+常见原因：虚拟机/容器挂起后恢复导致时钟停滞、主机未启用 NTP、新装系统默认时间错误、硬件时钟（RTC）电池失效。若校时后仍反复出现偏差，请检查 NTP 服务是否持续运行，而非仅做了一次性校时。
