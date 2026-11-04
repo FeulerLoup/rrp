@@ -60,8 +60,8 @@ usage() {
   RRP_MIRROR              同 --mirror
 
 示例:
-  curl -fsSL https://raw.githubusercontent.com/FeulerLoup/rrp/main/scripts/install.sh | bash
-  curl -fsSL https://ghfast.top/https://raw.githubusercontent.com/FeulerLoup/rrp/main/scripts/install.sh | bash -s -- --mirror ghfast.top
+  curl -fsSL https://raw.githubusercontent.com/FeulerLoup/rrp/master/scripts/install.sh | bash
+  curl -fsSL https://ghfast.top/https://raw.githubusercontent.com/FeulerLoup/rrp/master/scripts/install.sh | bash -s -- --mirror ghfast.top
   ./scripts/install.sh --version v0.1.0 --dir /usr/local/bin
 EOF
 }

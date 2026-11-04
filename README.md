@@ -4,10 +4,10 @@
 
 ```bash
 # 自动识别系统 (Linux x64/arm64, macOS arm64) 下载安装最新 Release 二进制
-curl -fsSL https://raw.githubusercontent.com/FeulerLoup/rrp/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/FeulerLoup/rrp/master/scripts/install.sh | bash
 
 # 使用 GitHub 代理镜像加速一键安装（如国内网络环境）
-curl -fsSL https://ghfast.top/https://raw.githubusercontent.com/FeulerLoup/rrp/main/scripts/install.sh | bash -s -- --mirror ghfast.top
+curl -fsSL https://ghfast.top/https://raw.githubusercontent.com/FeulerLoup/rrp/master/scripts/install.sh | bash -s -- --mirror ghfast.top
 
 # 或指定版本与安装目录
 ./scripts/install.sh --version v0.1.0 --dir /usr/local/bin
