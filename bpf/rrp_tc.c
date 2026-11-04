@@ -41,7 +41,11 @@ char LICENSE[] SEC("license") = "GPL";
 #define TCPOPT_EOL 0
 #define TCPOPT_NOP 1
 #define TCPOPT_MSS 2
+#define TCPOLEN_MSS 4
 #define TCP_MAX_OPTION_BYTES 40
+/* Option entries (NOPs included) examined before giving up on finding MSS. Real SYNs carry
+ * at most ~8; every entry is a verifier pass, so this bounds verification cost. */
+#define TCP_MAX_OPTION_SCAN 16
 
 struct rrp_port_key {
 	__u8 family; /* RRP_FAMILY_V4 / RRP_FAMILY_V6 */
@@ -235,32 +239,53 @@ static __always_inline int parse_packet(struct __sk_buff *skb, __u32 ip_off, str
 					opt_len = TCP_MAX_OPTION_BYTES;
 				__u8 *opt = (__u8 *)(tcp + 1);
 				__u32 i = 0;
-				/* Bounded loop (kernel 5.3+); the verifier tracks i < opt_len <= 40. */
-				for (int n = 0; n < TCP_MAX_OPTION_BYTES; n++) {
-					if (i >= opt_len)
+				/*
+				 * Bounded loop (kernel 5.3+), shaped for the verifier. Both halves matter;
+				 * each was measured against 6.1 and 7.0 kernels:
+				 *
+				 * - The counter n stays. Verifiers before 6.9 report "infinite loop
+				 *   detected" when a loop-head state is a subset of an ancestor state still
+				 *   being explored, which is exactly what happens when i (a range) is the
+				 *   only loop state. A constant counter makes every pass distinct.
+				 * - i is masked to [0, 63] on every back edge, so each pass arrives at the
+				 *   loop head with one canonical range instead of a fresh [k, 40 + 255]
+				 *   per path. Without this the verifier cannot merge any two states, the
+				 *   cost grows quadratically in the pass count (>1M instructions on 6.1,
+				 *   "BPF program is too large") and the kernel rejects the program. The
+				 *   mask is a no-op for real packets: i never exceeds opt_len <= 40.
+				 * - One data_end check for the 4 bytes at opt + i covers kind, len and the
+				 *   MSS value. MSS is a 4-byte option, so the scan stops once fewer bytes
+				 *   remain.
+				 */
+				for (int n = 0; n < TCP_MAX_OPTION_SCAN; n++) {
+					if (i > TCP_MAX_OPTION_BYTES - TCPOLEN_MSS)
 						break;
-					if ((void *)(opt + i + 1) > data_end)
+					if (i + TCPOLEN_MSS > opt_len)
+						break;
+					if ((void *)(opt + i + TCPOLEN_MSS) > data_end)
 						break;
 					__u8 kind = opt[i];
 					if (kind == TCPOPT_EOL)
 						break;
 					if (kind == TCPOPT_NOP) {
-						i += 1;
+						i = (i + 1) & 0x3f;
 						continue;
 					}
-					if ((void *)(opt + i + 2) > data_end)
-						break;
 					__u8 len = opt[i + 1];
 					if (len < 2)
 						break;
-					if (kind == TCPOPT_MSS && len == 4) {
-						if ((void *)(opt + i + 4) > data_end)
-							break;
-						p->mss = ((__u16)opt[i + 2] << 8) | opt[i + 3];
-						p->mss_off = p->l4_off + sizeof(*tcp) + i + 2;
+					if (kind == TCPOPT_MSS) {
+						if (len == TCPOLEN_MSS) {
+							p->mss = ((__u16)opt[i + 2] << 8) | opt[i + 3];
+							p->mss_off = p->l4_off + sizeof(*tcp) + i + 2;
+						}
 						break;
 					}
 					i += len;
+					/* An option running past the header is malformed; stop before the mask could wrap. */
+					if (i > opt_len)
+						break;
+					i &= 0x3f;
 				}
 			}
 		}
