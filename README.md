@@ -19,6 +19,34 @@ curl -fsSL https://ghfast.top/https://raw.githubusercontent.com/FeulerLoup/rrp/m
 ./scripts/release.sh 0.1.0    # 或 ./scripts/release.sh patch / minor / major
 ```
 
+### 升级到新版本（保留当前配置）
+
+安装脚本只替换 `rrp` 二进制，不会改动 `/usr/local/etc/rrp/` 下的配置文件、密钥与已授权公钥，
+也不会改动已注册的自启服务，因此升级只需重新执行安装脚本，再重启正在运行的服务：
+
+```bash
+# 1. 下载并覆盖安装最新版本（国内网络可追加 -s -- --mirror ghfast.top，或改用上面的镜像地址）
+curl -fsSL https://raw.githubusercontent.com/FeulerLoup/rrp/master/scripts/install.sh | bash
+
+# 或升级到指定版本
+curl -fsSL https://raw.githubusercontent.com/FeulerLoup/rrp/master/scripts/install.sh | bash -s -- --version v0.2.0
+
+# 2. 确认版本
+rrp --version
+
+# 3a. Linux (systemd)：重启正在运行的服务，使新二进制生效（更多服务管理命令见第 4 节）
+sudo systemctl restart rrp-server    # 服务端
+sudo systemctl restart rrp-client    # 客户端
+
+# 3b. macOS (launchd)
+sudo launchctl kickstart -k system/com.rrp.server
+sudo launchctl kickstart -k system/com.rrp.client
+```
+
+- 若首次安装时用 `--dir` 指定了安装目录，升级时须传入同一目录：自启服务文件中记录的是安装时的二进制绝对路径。
+- 升级无需重新执行 `rrp install` / `rrp approve`；不要使用 `rrp uninstall --purge`，它会删除配置文件与密钥。
+- 未配置自启、手动以 `rrp server` / `rrp client` 前台运行的，停止旧进程后重新启动即可。
+
 ## 1. 客户端生成密钥与设置开机自启
 
 ```bash
@@ -123,6 +151,29 @@ rrp client
 # 启动客户端并通过命令行指定/覆盖多个服务端地址
 rrp client -c /usr/local/etc/rrp/rrpc.toml -s 203.0.113.10:3700,198.51.100.20:3700
 ```
+
+### 重启与管理自启服务
+
+通过 `rrp install --autostart` 注册的服务，修改配置文件、执行 `rrp approve` 或升级二进制后，需要重启才能生效：
+
+```bash
+# Linux (systemd)：服务名为 rrp-server / rrp-client
+sudo systemctl restart rrp-server     # 重启服务端
+sudo systemctl restart rrp-client     # 重启客户端
+sudo systemctl start rrp-server       # --autostart 只设置开机自启，首次需手动启动（或重启机器）
+sudo systemctl stop rrp-server        # 停止
+systemctl status rrp-server           # 查看服务状态
+journalctl -u rrp-server -f           # 跟踪日志
+
+# macOS (launchd)：服务标签为 com.rrp.server / com.rrp.client
+sudo launchctl kickstart -k system/com.rrp.server    # 重启服务端
+sudo launchctl kickstart -k system/com.rrp.client    # 重启客户端
+sudo launchctl unload -w /Library/LaunchDaemons/com.rrp.server.plist   # 停止并取消自启
+sudo launchctl load -w /Library/LaunchDaemons/com.rrp.server.plist     # 重新加载并启动
+tail -f /var/log/rrp-server.log /var/log/rrp-server.err.log           # 查看日志
+```
+
+前台手动运行的 `rrp server` / `rrp client`，按 `Ctrl+C` 停止后重新执行即可重启。
 
 ## 4.1 内核隧道数据面（Linux 服务端 eBPF + WireGuard）
 
